@@ -262,7 +262,8 @@ The full language reference lives in [`docs/lang/`](docs/lang/):
 | 21 | [Operator Overloading](docs/lang/21_operator_overloading.md) |
 
 ---
-
+##Install Tauraro on Termux Android App
+'curl -sSL https://raw.githubusercontent.com/farukabdulrauf/tauraro/master/termux/tauraro-installer.sh | bash'
 ## License
 
 Tauraro is dual-licensed under your choice of:
