@@ -1,91 +1,121 @@
 #!/bin/bash
 
-echo "===================================="
-echo "🚀 Tauraro Installation Script"
-echo "===================================="
+echo "🚀 Starting Tauraro Smart Installer with Cleanup..."
 
-# Retry function with exponential backoff
-retry_with_backoff() {
-    local max_attempts=${1:-5}
-    local command="$2"
-    local description="$3"
-    local attempt=1
-    local delay=1
+# Update Termux
+echo "📦 Updating Termux..."
+pkg upgrade -y && pkg update -y || echo "⚠️ Package update completed with warnings."
 
-    while [ $attempt -le $max_attempts ]; do
-        echo "🔄 Attempt $attempt/$max_attempts: $description"
-        eval "$command"
-        
-        if [ $? -eq 0 ]; then
-            echo "✅ Success on attempt $attempt"
-            return 0
-        fi
+echo "🔍 Checking latest Tauraro version from GitHub..."
 
-        if [ $attempt -lt $max_attempts ]; then
-            echo "❌ Attempt $attempt failed. Retrying in ${delay}s..."
-            sleep $delay
-            delay=$((delay * 2))  # Exponential backoff: 1, 2, 4, 8, 16...
-        fi
-        attempt=$((attempt + 1))
+# Get latest release info with error handling
+API_RESPONSE=$(curl -s -f -L --connect-timeout 10 --max-time 20 https://api.github.com/repos/tauraro/tauraro/releases/latest)
+
+if [ $? -ne 0 ] || [ -z "$API_RESPONSE" ]; then
+    echo "❌ Failed to connect to GitHub. Using fallback v0.0.3"
+    LATEST_TAG="v0.0.3"
+    LATEST_URL="https://github.com/tauraro/tauraro/releases/download/v0.0.3/tauraroc-linux-arm64.zip"
+else
+    LATEST_TAG=$(echo "$API_RESPONSE" | grep '"tag_name"' | cut -d '"' -f 4)
+    LATEST_URL=$(echo "$API_RESPONSE" | grep "browser_download_url.*linux-arm64.zip" | cut -d '"' -f 4)
+    
+    if [ -z "$LATEST_TAG" ] || [ -z "$LATEST_URL" ]; then
+        echo "⚠️ Failed to parse release info. Using fallback."
+        LATEST_TAG="v0.0.3"
+        LATEST_URL="https://github.com/tauraro/tauraro/releases/download/v0.0.3/tauraroc-linux-arm64.zip"
+    fi
+fi
+
+echo "Latest version : $LATEST_TAG"
+
+ZIP_FILE="tauraroc-linux-arm64.zip"
+
+# Semantic Version Comparison
+version_compare() {
+    local v1=$(echo "$1" | tr -d 'vV')
+    local v2=$(echo "$2" | tr -d 'vV')
+    IFS='.' read -ra VER1 <<< "$v1"
+    IFS='.' read -ra VER2 <<< "$v2"
+    local i=0
+    while [[ ${VER1[i]} || ${VER2[i]} ]]; do
+        local num1=${VER1[i]:-0}
+        local num2=${VER2[i]:-0}
+        if (( num1 > num2 )); then return 1; fi
+        if (( num1 < num2 )); then return 2; fi
+        ((i++))
     done
-
-    echo "❌ Failed after $max_attempts attempts: $description"
-    return 1
+    return 0
 }
 
-# Check internet connection
-check_internet() {
-    echo "🌐 Checking internet connection..."
-    if ! ping -c 1 8.8.8.8 &> /dev/null && ! ping -c 1 google.com &> /dev/null; then
-        echo "❌ No internet connection detected!"
-        echo "Please connect to the internet and try again."
+# Check current version
+CURRENT_VERSION="none"
+if command -v tauraroc &> /dev/null; then
+    CURRENT_VERSION=$(tauraroc --version 2>/dev/null | head -n1 | awk '{print $2}' || echo "unknown")
+    echo "Current version : $CURRENT_VERSION"
+else
+    echo "No previous installation found."
+fi
+
+# Decide whether to download
+SHOULD_DOWNLOAD=true
+if [ "$CURRENT_VERSION" != "none" ] && [ "$CURRENT_VERSION" != "unknown" ]; then
+    version_compare "$CURRENT_VERSION" "$LATEST_TAG"
+    RESULT=$?
+    if [ $RESULT -eq 0 ]; then
+        echo "✅ Already on latest version."
+        SHOULD_DOWNLOAD=false
+    elif [ $RESULT -eq 1 ]; then
+        echo "🎉 You have a newer version than GitHub."
+        SHOULD_DOWNLOAD=false
+    else
+        echo "📦 New version available. Updating..."
+    fi
+fi
+
+# Download
+if [ "$SHOULD_DOWNLOAD" = true ]; then
+    echo "📥 Downloading $LATEST_TAG ..."
+    if ! curl -L -f --connect-timeout 15 --max-time 60 -# -o "$ZIP_FILE" "$LATEST_URL"; then
+        echo "❌ Download failed!"
         exit 1
     fi
-    echo "✅ Internet is available"
-}
+    echo "✅ Download completed."
+fi
 
-# Main installation
-check_internet
-
-# Update & Upgrade with retry
-retry_with_backoff 4 \
-    "pkg update -y && pkg upgrade -y" \
-    "Updating Termux packages"
-
-# Download with retry + curl built-in retries
-retry_with_backoff 5 \
-    "curl -L -O -f --retry 3 --retry-delay 5 --retry-max-time 60 https://github.com/tauraro/tauraro/releases/download/v0.0.3/tauraroc-linux-arm64.zip" \
-    "Downloading Tauraro"
-
-# Verify download
-if [ ! -f "tauraroc-linux-arm64.zip" ]; then
-    echo "❌ Downloaded file not found!"
-    exit 1
+# Cleanup old installation (optional but recommended for clean update)
+echo "🧹 Cleaning old files..."
+rm -rf tauraro_old 2>/dev/null
+if [ -d "tauraro" ]; then
+    echo "Backing up old version to tauraro_old..."
+    mv tauraro tauraro_old
 fi
 
 # Extract
-retry_with_backoff 3 \
-    "unzip -o tauraroc-linux-arm64.zip -d tauraro" \
-    "Extracting files"
-
-# Add to PATH (only once)
-if ! grep -q "tauraro" \~/.bashrc; then
-    echo 'export PATH="$HOME/tauraro:$PATH"' >> \~/.bashrc
-    echo "✅ Added Tauraro to PATH permanently"
-else
-    echo "ℹ️  Tauraro is already in PATH"
+echo "📦 Extracting new version..."
+if ! unzip -o "$ZIP_FILE" -d tauraro; then
+    echo "❌ Extraction failed!"
+    exit 1
 fi
 
-# Reload shell
-source \~/.bashrc
+# Automatic Cleanup: Remove zip file after successful extraction
+echo "🧹 Cleaning up zip file..."
+rm -f "$ZIP_FILE"
 
-# Verify installation
-cd tauraro 2>/dev/null || { echo "❌ Could not enter tauraro directory"; exit 1; }
+# Optional: Remove old backup after successful install
+rm -rf tauraro_old 2>/dev/null
 
-echo "🔍 Checking installed version..."
+# Setup PATH
+echo "🔧 Setting up PATH..."
+touch "$HOME/.bashrc"
+echo 'export PATH="$HOME/tauraro:$PATH"' >> "$HOME/.bashrc"
+source "$HOME/.bashrc"
+
+# Finalize
+cd tauraro 2>/dev/null || { echo "❌ Failed to enter directory"; exit 1; }
+
+echo ""
+echo "🎉 Tauraro $LATEST_TAG installed/updated successfully!"
 tauraroc --version
 
 echo ""
-echo "🎉 Installation completed successfully!"
-echo "You can now use 'tauraroc' command from anywhere."
-echo "===================================="
+echo "🧼 Cleanup completed. Ready to use!"
