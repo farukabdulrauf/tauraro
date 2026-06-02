@@ -264,7 +264,8 @@ The full language reference lives in [`docs/lang/`](docs/lang/):
 ---
 ## Install Tauraro on Termux Android App
 ```python
-curl -sSL https://raw.githubusercontent.com/farukabdulrauf/tauraro/master/termux/tauraro-installer.sh | bash```
+curl -sSL https://raw.githubusercontent.com/farukabdulrauf/tauraro/master/termux/tauraro-installer.sh | bash
+```
 
 ## License
 
