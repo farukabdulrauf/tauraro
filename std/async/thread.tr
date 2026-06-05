@@ -1,0 +1,57 @@
+# std.async.thread — Thread handle, Atomic[T], and ThreadLocal[T].
+#
+# The language already provides first-class concurrency syntax:
+#   spawn fn(args)              fire-and-forget detached thread
+#   task_group:                 structured concurrency (wait for all)
+#   await_all(f1(), f2(), ...)  run functions in parallel
+#
+# This module provides explicit handle-based threading:
+#
+#   Thread — joinable OS-thread handle returned by Thread.spawn(fn, arg)
+#     t.join()          wait for completion
+#     t.detach()        let the OS clean up automatically
+#     Thread.sleep(ms)  sleep the calling thread
+#     Thread.id()       calling thread's OS id
+#
+#   Atomic — lock-free atomic integer (backed by C11 _Atomic long long)
+#     mut a: Atomic[int] = Atomic.new(0)
+#     a.add(1)          fetch-and-add, returns PREVIOUS value
+#     a.load()          atomic load
+#     a.store(v)        atomic store
+#     a.cas(e, d)       compare-and-swap, returns bool
+#
+#   ThreadLocal — per-thread storage (TLS)
+#     mut tl: ThreadLocal[int] = ThreadLocal.new(0)
+#     tl.set(42)        only affects the calling thread
+#     tl.get()          returns calling thread's copy
+#
+# NOTE: These are built-in types handled by the compiler's built-in dispatch.
+# Importing this module makes the names available; no OOP wrapper is needed.
+
+# ─── Thread ────────────────────────────────────────────────────────────────────
+#
+# Thread.spawn(fn, arg) is a language-level operation dispatched by the compiler.
+# The Thread type provides the join/detach/sleep/id operations on the handle.
+# All method calls are handled via compiler built-in dispatch.
+
+pub class Thread:
+    pass
+
+# ─── Atomic ────────────────────────────────────────────────────────────────────
+#
+# Lock-free atomic integer.  All operations are sequentially consistent.
+# Backed by C11 _Atomic long long — zero OS overhead.
+# All method calls (new, load, store, add, sub, swap, cas, increment, decrement, free)
+# are handled via compiler built-in dispatch to _tr_atomic_* runtime functions.
+
+pub class Atomic:
+    pass
+
+# ─── ThreadLocal ───────────────────────────────────────────────────────────────
+#
+# Thread-local storage: each OS thread sees its own independent copy of the value.
+# Backed by Win32 TLS slots on Windows, pthread_key_t on POSIX.
+# All method calls (new, get, set, free) handled via compiler built-in dispatch.
+
+pub class ThreadLocal:
+    pass

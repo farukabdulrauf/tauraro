@@ -6,15 +6,16 @@ from core.alloc import alloc, dealloc
 # ─── Type annotations ─────────────────────────────────────────────────────────
 
 pub class AstType:
-    pub name: str                        
-    pub args: Vec[Pointer[AstType]]      
+    pub name: str
+    pub args: Vec[Pointer[AstType]]
+    pub from_param: str  # 'from X' lifetime annotation — empty means none
 
 extend AstType:
     pub def init(name: str) -> AstType:
-        # print("DEBUG: AstType.init " + name)
         mut t = AstType()
         t.name = name
         t.args = Vec[Pointer[AstType]].init(0)
+        t.from_param = ""
         return t
 
     pub def init_generic(name: str, arg: Pointer[AstType]) -> AstType:
@@ -22,6 +23,7 @@ extend AstType:
         t.name = name
         t.args = Vec[Pointer[AstType]].init(1)
         t.args.push(arg)
+        t.from_param = ""
         return t
 
 pub class GenericConstraint:
@@ -60,15 +62,11 @@ pub enum Pattern:
     PVariantBind(type_name: str, variant: str, field: str)
     PVariantBindMany(type_name: str, variant: str, fields: Vec[str])
     PTuple(first: str, second: str)
-    PRange(start: Pointer[Pattern], end: Pointer[Pattern])
     POr(patterns: Vec[Pattern])
 
 pub enum Ownership:
     Own
-    Borrow
-    Move
     Shared
-    Stack
 
 pub class Comprehension:
     pub target: str
@@ -172,6 +170,38 @@ pub enum Expr:
     ESizeOf(ty: Pointer[AstType])
     EIfElse(cond: Pointer[Expr], then_expr: Pointer[Expr], else_expr: Pointer[Expr])
 
+# ─── Chan-select arms ─────────────────────────────────────────────────────────
+
+pub class ChanSelectArm:
+    pub kind: int                   # 0=recv, 1=send, 2=timeout, 3=default
+    pub chan_expr: Pointer[Expr]
+    pub val_expr: Pointer[Expr]     # send value
+    pub var_name: str               # recv binding name
+    pub timeout_ms: Pointer[Expr]
+    pub body: Block
+
+extend ChanSelectArm:
+    pub def init_recv(chan: Pointer[Expr], var: str, body: Block) -> ChanSelectArm:
+        mut a = ChanSelectArm()
+        a.kind = 0; a.chan_expr = chan; a.val_expr = Pointer[Expr](0)
+        a.var_name = var; a.timeout_ms = Pointer[Expr](0); a.body = body
+        return a
+    pub def init_send(chan: Pointer[Expr], val: Pointer[Expr], body: Block) -> ChanSelectArm:
+        mut a = ChanSelectArm()
+        a.kind = 1; a.chan_expr = chan; a.val_expr = val
+        a.var_name = ""; a.timeout_ms = Pointer[Expr](0); a.body = body
+        return a
+    pub def init_timeout(ms: Pointer[Expr], body: Block) -> ChanSelectArm:
+        mut a = ChanSelectArm()
+        a.kind = 2; a.chan_expr = Pointer[Expr](0); a.val_expr = Pointer[Expr](0)
+        a.var_name = ""; a.timeout_ms = ms; a.body = body
+        return a
+    pub def init_default(body: Block) -> ChanSelectArm:
+        mut a = ChanSelectArm()
+        a.kind = 3; a.chan_expr = Pointer[Expr](0); a.val_expr = Pointer[Expr](0)
+        a.var_name = ""; a.timeout_ms = Pointer[Expr](0); a.body = body
+        return a
+
 # ─── Statements ───────────────────────────────────────────────────────────────
 
 pub enum Stmt:
@@ -197,6 +227,7 @@ pub enum Stmt:
     SSpawn(expr: Pointer[Expr])
     STaskGroup(body: Block)
     SGpuBlock(body: Block)
+    SChanSelect(cases: Vec[Pointer[ChanSelectArm]])
     SLine(n: int)
 
 pub class Block:
@@ -232,13 +263,17 @@ extend ElifClause:
 
 pub class Param:
     pub name: str
-    pub ty: Pointer[AstType]    
+    pub ty: Pointer[AstType]
+    pub is_ref: bool      # 'ref T' parameter — immutable borrow, not a copy
+    pub is_mut_ref: bool  # 'mut ref T' parameter — mutable borrow
 
 extend Param:
     pub def init(name: str, ty: Pointer[AstType]) -> Param:
         mut p = Param()
         p.name = name
         p.ty = ty
+        p.is_ref = false
+        p.is_mut_ref = false
         return p
 
 # ─── Top-level declarations ───────────────────────────────────────────────────
