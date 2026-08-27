@@ -20,6 +20,18 @@ version = 1            # type inferred: int
 pi: float = 3.14159    # type annotated explicitly
 ```
 
+**Optional `var` keyword.** You can prefix a declaration with `var` to make it explicit that a
+statement *declares* a variable (rather than assigns an existing one). It is entirely optional and
+changes nothing — `var age: int = 30` is identical to `age: int = 30` (both immutable; use `mut`
+for a mutable variable). `var` is a *contextual* keyword: it only marks a declaration when followed
+by a name, so `var` is still a perfectly valid variable or parameter name anywhere else.
+
+```python
+var age: int = 30      # explicit declaration — identical to `age: int = 30`
+var name = "Tauraro"   # inferred type
+count: int = 0         # the bare form works exactly the same (no keyword needed)
+```
+
 Variables declared without `mut` are **immutable** — they cannot be reassigned after declaration.
 The compiler enforces this: any attempt to assign a second value to an immutable binding is a
 hard error. This communicates intent clearly: if a variable never changes, the reader can rely on
@@ -29,7 +41,7 @@ that fact while reasoning about the code.
 
 ```python
 x = 10
-x = 20    # ERROR [M-6]: cannot assign to immutable binding 'x'
+x = 20    # ERROR [M-8]: cannot assign to immutable binding 'x'
 ```
 
 The most common mistake is forgetting to add `mut` when you later decide the variable needs to
@@ -134,7 +146,7 @@ cannot hold heap-allocated values like lists or class instances.
 
 ```python
 x = 10
-x = 20    # ERROR [M-6]: cannot assign to immutable binding 'x'
+x = 20    # ERROR [M-8]: cannot assign to immutable binding 'x'
 ```
 
 **Fix:** Add `mut` to the declaration:
@@ -148,7 +160,7 @@ x = 20    # OK
 ```python
 data = load_bytes()
 send(data)            # data moved into 'send'
-print(len(data))      # ERROR [M-2]: 'data' was moved into 'send' and is no longer valid
+print(len(data))      # ERROR [M-1]: 'data' was moved into 'send' and is no longer valid
 ```
 
 **Fix:** Do not use `data` after it is passed to a function that takes ownership. If you need
@@ -169,7 +181,9 @@ between numeric types silently.
 
 ```python
 x: int = 10
-y: float = x          # ERROR [T-1]: cannot assign int to float without explicit cast
+y: float = x          # ERROR: cannot assign int to float without explicit cast
+                       # (a dedicated diagnostic code for this is not yet
+                       # assigned — see "Reserved" in 19_compiler_errors.md)
 
 y: float = x as float  # OK
 back: int = y as int   # OK — truncates toward zero
@@ -182,7 +196,7 @@ extension, precision loss. Explicit casts make every conversion visible and audi
 
 ```python
 def area(width: int, height: int) -> float:
-    return width * height    # ERROR [T-1]: int expression in float return
+    return width * height    # ERROR: int expression in float return
     # Fix:
     return (width * height) as float
 ```
@@ -200,14 +214,19 @@ result = a as float / b     # CORRECT: cast before dividing — 7.0 / 2 = 3.5
 - When doing mixed-type arithmetic in a tight loop, define the variables with the correct type
   upfront so the casts are at the boundary, not scattered through the loop.
 
-### Compiler Rule T-2: Type Mismatch in Operations
+### Compiler Rule: Type Mismatch in Operations
 
 ```python
 mut a: int = 10
 mut b: float = 3.14
-mut c = a + b          # ERROR [T-2]: cannot add int and float
+mut c = a + b          # ERROR: cannot add int and float
 mut c = a as float + b  # OK
 ```
+
+> Note: the codes `[T-1]`/`[T-2]` are already used for the Sendable/concurrency
+> checks described in [16 — Concurrency](16_concurrency.md). The numeric
+> type-mismatch diagnostics shown here are not yet assigned a stable code —
+> see "Reserved" in [19 — Compiler Errors](19_compiler_errors.md).
 
 ---
 
@@ -423,11 +442,14 @@ def process(data: List[int], threshold: float) -> int:
 ### Common Mistakes
 
 ```python
-mut buf    # ERROR [T-5]: cannot infer type without initializer
+mut buf    # ERROR: cannot infer type without initializer
 ```
 
 If a variable is declared without a type annotation and without an initializer, the compiler
-errors with `[T-5] cannot infer type without initializer`. Always provide one or the other.
+errors. Always provide one or the other. (Note: `[T-5]` is already used for the
+"numeric value used as an `if` condition" check described in
+[19 — Compiler Errors](19_compiler_errors.md#t-5-numeric-condition); this
+missing-initializer case is not yet assigned its own stable code.)
 
 ### Best Practices
 
@@ -555,6 +577,91 @@ Assigning `none` to a value type is a compiler error:
 ```python
 mut x: int = none   # ERROR [M-7]: cannot assign 'none' to 'x' which has type 'int'
 ```
+
+---
+
+## Compile-Time Reflection: `instanceOf` and `inspect`
+
+### `instanceOf(obj, T)`
+
+#### When to use
+
+Use `instanceOf(obj, T)` to check whether an expression's **static type**
+is `T` — a class, enum, interface, or primitive type name.
+
+#### How it works
+
+```python
+mut p: Point = Point.init(1, 2)
+
+if instanceOf(p, Point):
+    print("p is a Point")
+
+if instanceOf(p, int):
+    print("unreachable")
+```
+
+`instanceOf` is evaluated entirely at **compile time**: it compares `obj`'s
+static type name against `T` and lowers directly to a `bool` literal
+(`true` or `false`). There is no runtime type tag — this checks the type the
+compiler already knows `obj` to have, so it is most useful in generic code
+or macros where the concrete type isn't obvious from the surrounding text.
+
+#### Common Mistakes
+
+**Expecting runtime polymorphic checks through interface references.**
+`instanceOf` compares the *static* type, not a runtime vtable tag — it
+cannot distinguish between concrete types behind a shared interface
+reference at runtime.
+
+---
+
+### `inspect(T)`
+
+#### When to use
+
+Use `inspect(T)` for a Python `help()`-style description of a class, enum,
+interface, function, or builtin type — including fields, methods, enum
+variants, function signatures, and any docstring (a triple-quoted or plain
+string literal as the first statement of a body).
+
+#### How it works
+
+```python
+class Point:
+    x: int
+    y: int
+
+    def dist(self) -> float:
+        """Returns distance from origin."""
+        return 0.0
+
+def main():
+    print(inspect(Point))
+    print(inspect(int))
+```
+
+```
+class Point:
+  fields:
+    x: int
+    y: int
+  methods:
+    def dist(self) -> float
+        """Returns distance from origin."""
+int: 64-bit signed integer (C long long).
+```
+
+`inspect(T)` is evaluated entirely at **compile time** and lowers to a
+string literal — `T` is a name (class, enum, interface, function, or
+builtin type), not a value expression. It works on names imported from
+other modules as well as types/functions defined in the current file.
+
+#### Common Mistakes
+
+**Passing a value instead of a name.** `inspect(p)` (where `p` is a
+variable) inspects `p`'s static type, not `p` itself — there is no runtime
+object introspection.
 
 ---
 

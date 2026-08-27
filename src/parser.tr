@@ -1,46 +1,91 @@
-# compiler/src/parser.tr — Recursive descent parser for the Tauraro self-hosted compiler.
+# @trusted: compiler systems module — audited raw-pointer core (like Rust std internals)
+# compiler/src/parser.tr - Recursive descent parser for the Tauraro self-hosted compiler.
 
 from core.vec import Vec
 from core.alloc import alloc, dealloc
 from token import Token
 from lexer import Lexer
-from ast import Program, Decl, AstType, Param, FunctionDef, FieldDef, ClassDef, VariantDef, EnumDef, InterfaceDef, ImportItem, Expr, Stmt, Block, ElifClause, MatchArm, Pattern, Decorator, FStringPart, Ownership, ChanSelectArm, CatchClause
+from diag import c_red, c_bold, c_cyan, c_dim, c_green, repeat_char
+from ast import Program, Decl, AstType, Param, FunctionDef, FieldDef, ClassDef, VariantDef, EnumDef, InterfaceDef, ImportItem, Expr, Stmt, Block, ElifClause, MatchArm, Pattern, Decorator, FStringPart, Ownership, ChanSelectArm, CatchClause, GenericConstraint
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# --- Helpers ------------------------------------------------------------------
 
 pub def box_expr(e: Expr) -> Pointer[Expr]:
-    mut p = alloc[Expr](1)
-    p.write(e)
-    return p
+    unsafe:
+        mut p = alloc[Expr](1)
+        p.write(e)
+        return p
 
 pub def box_stmt(s: Stmt) -> Pointer[Stmt]:
-    mut p = alloc[Stmt](1)
-    p.write(s)
-    return p
+    unsafe:
+        mut p = alloc[Stmt](1)
+        p.write(s)
+        return p
 
 pub def box_decl(d: Decl) -> Pointer[Decl]:
-    mut p = alloc[Decl](1)
-    p.write(d)
-    return p
+    unsafe:
+        mut p = alloc[Decl](1)
+        p.write(d)
+        return p
 
 pub def box_asttype(t: AstType) -> Pointer[AstType]:
-    mut p = alloc[AstType](1)
-    p.write(t)
-    return p
+    unsafe:
+        mut p = alloc[AstType](1)
+        p.write(t)
+        return p
 
-# ─── Parser class ──────────────────────────────────────────────────────────────
+# Extract the `n`-th (1-based) line of `src`, without its trailing newline.
+# Returns "" if `n` is out of range. Used for source-snippet diagnostics.
+pub def _nth_source_line(src: str, n: int) -> str:
+    if n <= 0: return ""
+    mut p = src as Pointer[char]
+    mut i = 0
+    mut line = 1
+    mut sb = StringBuilder.init(80)
+    while True:
+        mut c = 0
+        unsafe:
+            c = p.offset(i).read() as int
+        if c == 0: break
+        if line == n:
+            if c == 10 or c == 13: break
+            sb.append_char(c)
+        elif line > n:
+            break
+        if c == 10: line = line + 1
+        i = i + 1
+    return sb.to_string().as_str()
+
+# A string of `n` spaces (for aligning a caret under a source column).
+pub def _spaces(n: int) -> str:
+    mut sb = StringBuilder.init(n + 1)
+    mut i = 0
+    while i < n:
+        sb.append_char(32)
+        i = i + 1
+    return sb.to_string().as_str()
+
+# --- Parser class --------------------------------------------------------------
 
 pub class Parser:
     pub tokens: Vec[Token]
     pub pos: int
     pub lines: Vec[int]
+    pub cols: Vec[int]     # parallel 1-based columns (from lexer.token_cols); may be empty
+    pub src_text: str      # full source text, for source-snippet diagnostics ("" if unknown)
+    pub error_count: int   # number of parse errors emitted (0 = clean parse)
+    pub current_file: str  # source path, for diagnostic messages ("" if unknown)
 
 extend Parser:
     pub def init(tokens: Vec[Token], lines: Vec[int]) -> Parser:
         mut p = Parser()
         p.tokens = tokens
         p.lines = lines
+        p.cols = Vec[int].init(0)
+        p.src_text = ""
         p.pos = 0
+        p.error_count = 0
+        p.current_file = ""
         return p
 
     pub def peek(self) -> Token:
@@ -97,6 +142,55 @@ extend Parser:
         if self.lines.len > 0:
             return self.lines.get(self.lines.len - 1)
         return 0
+
+    # 1-based column of the current token (0 if column info is unavailable,
+    # e.g. for the f-string sub-parser which is given no token_cols).
+    pub def cur_col(self) -> int:
+        if self.pos < self.cols.len:
+            return self.cols.get(self.pos)
+        if self.cols.len > 0:
+            return self.cols.get(self.cols.len - 1)
+        return 0
+
+    # Render a diagnostic with the rustc-style format (colorized on a TTY):
+    #   error: <msg>
+    #     --> file:line:col
+    #      N | <source line>
+    #        |     ^^^^   (span underlined in red)
+    #        = help: <hint>
+    # Degrades gracefully: omits the col when 0, and the snippet/caret when
+    # the source text or column is unavailable. Color auto-disables off a TTY.
+    pub def emit_diag(self, msg: str, hint: str):
+        mut ln  = self.cur_line()
+        mut col = self.cur_col()
+        print(c_red("error") + ": " + c_bold(msg))
+        mut loc = ""
+        if self.current_file.len() > 0:
+            loc = self.current_file
+        mut head = loc + ":" + str(ln)
+        if col > 0:
+            head = head + ":" + str(col)
+        print("  " + c_cyan("-->") + " " + head)
+        # Source snippet + caret, when we have both the text and a column.
+        if self.src_text.len() > 0 and ln > 0:
+            mut srcline = _nth_source_line(self.src_text, ln)
+            if srcline.len() > 0:
+                mut gnum = "   " + str(ln) + " | "       # plain — used for width math
+                mut gbar = _spaces(gnum.len() - 2) + "| "
+                print(c_dim(gnum) + srcline)
+                if col > 0:
+                    # Underline a span as wide as the offending token (distance to
+                    # the next token on the same line), falling back to a single ^.
+                    mut width = 1
+                    if self.pos + 1 < self.cols.len and self.pos + 1 < self.lines.len:
+                        if self.lines.get(self.pos + 1) == ln:
+                            mut d = self.cols.get(self.pos + 1) - col
+                            if d > 0 and d < 200:
+                                width = d
+                    print(c_dim(gbar) + _spaces(col - 1) + c_red(repeat_char("^", width)))
+        if hint.len() > 0:
+            print("  " + c_green("= help") + ": " + hint)
+        self.error_count = self.error_count + 1
 
     pub def consume_ident(self) -> str:
         match self.peek():
@@ -168,7 +262,7 @@ extend Parser:
                 return self.consume_ident()
         return ""
 
-    # ── Type parsing ──────────────────────────────────────────────────────────
+    # -- Type parsing ----------------------------------------------------------
 
     pub def parse_type(self) -> AstType:
         mut name = ""
@@ -177,7 +271,7 @@ extend Parser:
                 self.pos = self.pos + 1
                 return AstType.init("void")
             case Token.LParen:
-                # Tuple type: (T1, T2, ...) → AstType{ name="Tuple", args=[T1,T2,...] }
+                # Tuple type: (T1, T2, ...) -> AstType{ name="Tuple", args=[T1,T2,...] }
                 self.pos = self.pos + 1
                 mut tup_t = AstType.init("Tuple")
                 while self.peek() != Token.RParen and self.peek() != Token.Eof:
@@ -186,16 +280,51 @@ extend Parser:
                     if self.peek() == Token.Comma: self.pos = self.pos + 1
                 if self.peek() == Token.RParen: self.pos = self.pos + 1
                 return tup_t
+            case Token.LBracket:
+                # Fixed-size array type: [T; N] -> AstType{name="Array", args=[T], array_size=N}
+                self.pos = self.pos + 1
+                mut arr_t = AstType.init("Array")
+                mut arr_elem = self.parse_type()
+                arr_t.args.push(box_asttype(arr_elem))
+                if self.peek() == Token.Semicolon:
+                    self.pos = self.pos + 1
+                    match self.peek():
+                        case Token.IntLit(arr_sz):
+                            arr_t.array_size = arr_sz
+                            self.pos = self.pos + 1
+                        case _: pass
+                if self.peek() == Token.RBracket: self.pos = self.pos + 1
+                return arr_t
+            case Token.KwDef:
+                # Function-pointer type: def(T1, T2) -> R  (zero-cost callable
+                # value: a pointer to a top-level function). Encoded internally
+                # as AstType{name="def", args=[T1, ..., R]} (last arg = return).
+                self.pos = self.pos + 1
+                mut dfn_t = AstType.init("def")
+                if self.peek() == Token.LParen:
+                    self.pos = self.pos + 1
+                    while self.peek() != Token.RParen and self.peek() != Token.Eof:
+                        mut dpt = self.parse_type()
+                        dfn_t.args.push(box_asttype(dpt))
+                        if self.peek() == Token.Comma: self.pos = self.pos + 1
+                    if self.peek() == Token.RParen: self.pos = self.pos + 1
+                mut dret = AstType.init("void")
+                if self.peek() == Token.Arrow:
+                    self.pos = self.pos + 1
+                    dret = self.parse_type()
+                dfn_t.args.push(box_asttype(dret))
+                return dfn_t
             case Token.KwMut:
-                # "mut ref T" — mutable reference/borrow type (optional, advanced)
+                # "mut ref T" - mutable (exclusive) borrow. ERASES to the inner type
+                # T for codegen; the is_borrow/is_mut_borrow flags drive checking.
                 self.pos = self.pos + 1
                 mut mr_name = self.consume_ident()
                 if mr_name == "ref":
                     mut mr_inner = self.parse_type()
-                    mut mr_t = AstType.init("mut_ref")
-                    mr_t.args.push(box_asttype(mr_inner))
-                    return mr_t
-                # Malformed — just return void
+                    mr_inner.is_borrow = true
+                    mr_inner.is_mut_borrow = true
+                    return mr_inner
+                # Malformed - just return void
                 return AstType.init("void")
             case _:
                 name = self.consume_ident()
@@ -203,12 +332,15 @@ extend Parser:
         if name == "":
             return AstType.init("void")
 
-        # "ref T" — immutable borrow type (optional lifetime syntax, Proposal 3)
+        # "ref T" - immutable (shared) borrow / region view. ERASES to the inner
+        # type T for codegen (so a `ref str` is usable exactly like a `str`); the
+        # is_borrow flag + a `from` region drive borrow checking. Named regions are
+        # a checking concept layered over the ARC floor, not a representation change.
         if name == "ref":
             mut ref_inner = self.parse_type()
-            mut ref_t = AstType.init("ref")
-            ref_t.args.push(box_asttype(ref_inner))
-            return ref_t
+            ref_inner.is_borrow = true
+            return ref_inner
+
 
         match self.peek():
             case Token.LBracket:
@@ -227,6 +359,17 @@ extend Parser:
                         match self.peek():
                             case Token.Comma:
                                 self.pos = self.pos + 1
+                            case Token.Semicolon:
+                                # `Name[T; N]` — an int size after `;` (mirrors the fixed-array
+                                # `[T; N]` form). Used by Bits[T; N] (bitfield width) and
+                                # Simd[T; N] (lane count); stored in array_size.
+                                self.pos = self.pos + 1
+                                match self.peek():
+                                    case Token.IntLit(gsz):
+                                        t.array_size = gsz
+                                        self.pos = self.pos + 1
+                                    case _: pass
+                                going = False
                             case _:
                                 going = False
                 match self.peek():
@@ -239,7 +382,7 @@ extend Parser:
                 pass
         return AstType.init(name)
 
-    # ── Param list parsing ────────────────────────────────────────────────────
+    # -- Param list parsing ----------------------------------------------------
 
     pub def parse_param_list(self) -> Vec[Param]:
         mut pl = Vec[Param].init(4)
@@ -252,22 +395,47 @@ extend Parser:
                 case _:
                     pass
             if going:
-                item_name = self.consume_ident()
+                mut item_name = self.consume_ident()
                 if item_name != "":
                     mut ty_ptr = Pointer[AstType](0)
                     match self.peek():
                         case Token.Colon:
                             self.pos = self.pos + 1
                             ty = self.parse_type()
+                            # Param region: `a: ref str from r`. A single region only —
+                            # a comma here separates parameters, not regions.
+                            if self.peek() == Token.KwFrom:
+                                self.pos = self.pos + 1
+                                ty.from_param = self.consume_ident()
+                                ty.from_regions.push(ty.from_param)
                             ty_ptr = box_asttype(ty)
                         case _:
-                            pass
+                            # Bare-type field (enum variant payload), e.g. `Word(str)` —
+                            # `item_name` IS the type. Support a borrowed bare type
+                            # `ref T from r`: `item_name == "ref"` means the real type
+                            # follows; parse it, mark the borrow, and read the region.
+                            if item_name == "ref":
+                                mut bt = self.parse_type()
+                                bt.is_borrow = true
+                                if self.peek() == Token.KwFrom:
+                                    self.pos = self.pos + 1
+                                    bt.from_param = self.consume_ident()
+                                    bt.from_regions.push(bt.from_param)
+                                ty_ptr = box_asttype(bt)
+                                # Mirror the bare-type convention: the field name is the
+                                # inner type's name (codegen derives `_tr_v_<name>` from it).
+                                item_name = bt.name
                     p = Param.init(item_name, ty_ptr)
                     if ty_ptr as usize != 0 as usize:
-                        if ty_ptr.read().name == "ref":
+                        if ty_ptr.read().is_borrow:
                             p.is_ref = true
-                        if ty_ptr.read().name == "mut_ref":
+                        if ty_ptr.read().is_mut_borrow:
                             p.is_mut_ref = true
+                    # Variadic param: `args...` or `args: T...` collects trailing
+                    # call args into a List[T] (T defaults to int if unannotated).
+                    if self.peek() == Token.DotDotDot:
+                        self.pos = self.pos + 1
+                        p.is_variadic = true
                     pl.push(p)
                     match self.peek():
                         case Token.Comma:
@@ -279,7 +447,7 @@ extend Parser:
                     going = False
         return pl
 
-    # ── Block parsing ─────────────────────────────────────────────────────────
+    # -- Block parsing ---------------------------------------------------------
 
     pub def parse_block(self) -> Block:
         mut b = Block.init()
@@ -301,7 +469,7 @@ extend Parser:
                 semi_going = False
                 match self.peek():
                     case Token.Semicolon:
-                        # Explicit semicolon still present — consume and parse next stmt.
+                        # Explicit semicolon still present - consume and parse next stmt.
                         self.pos = self.pos + 1
                         match self.peek():
                             case Token.Newline | Token.Eof | Token.Dedent:
@@ -353,7 +521,7 @@ extend Parser:
                 pass
         return b
 
-    # ── Statement parsing ─────────────────────────────────────────────────────
+    # -- Statement parsing -----------------------------------------------------
 
     pub def parse_stmt(self) -> Pointer[Stmt]:
         match self.peek():
@@ -373,8 +541,18 @@ extend Parser:
                 return box_stmt(Stmt.SPass)
             case Token.KwBreak:
                 self.pos = self.pos + 1
+                # `break <value>` carries a result out of a loop/while expression;
+                # a bare `break` (followed by end-of-statement) has a null value.
+                mut brk_val = Pointer[Expr](0)
+                match self.peek():
+                    case Token.Newline: pass
+                    case Token.Dedent: pass
+                    case Token.Eof: pass
+                    case Token.Semicolon: pass
+                    case _:
+                        brk_val = self.parse_expr()
                 self.expect_newline()
-                return box_stmt(Stmt.SBreak)
+                return box_stmt(Stmt.SBreak(brk_val))
             case Token.KwContinue:
                 self.pos = self.pos + 1
                 self.expect_newline()
@@ -396,6 +574,8 @@ extend Parser:
                 return self.parse_if_stmt()
             case Token.KwWhile:
                 return self.parse_while_stmt()
+            case Token.KwLoop:
+                return self.parse_loop_stmt()
             case Token.KwFor:
                 return self.parse_for_stmt()
             case Token.KwMatch:
@@ -415,6 +595,11 @@ extend Parser:
                         pass
                 body = self.parse_block()
                 return box_stmt(Stmt.SUnsafe(body))
+            case Token.KwDefer:
+                # defer stmt - deferred execution at function exit (LIFO)
+                self.pos = self.pos + 1
+                mut deferred = self.parse_stmt()
+                return box_stmt(Stmt.SDefer(deferred))
             case Token.KwWith:
                 return self.parse_with_stmt()
             case Token.KwTry:
@@ -422,18 +607,60 @@ extend Parser:
             case Token.KwAssert:
                 return self.parse_assert_stmt()
             case Token.KwFrom:
-                # Local `from X import Y` inside function body — already resolved at module level.
+                # Local `from X import Y` inside function body - already resolved at module level.
                 self.parse_from_import()
                 return box_stmt(Stmt.SPass)
             case Token.KwImport:
                 self.parse_import()
                 return box_stmt(Stmt.SPass)
+            # Nested declarations - class/def/enum/interface/extend inside a function
+            # body (Java-style local types). Sema restricts these to main() and
+            # hoists them to file scope; codegen emits them as ordinary top-level
+            # definitions.
+            case Token.KwClass:
+                return box_stmt(Stmt.SLocalDecl(self.parse_decl()))
+            case Token.KwEnum:
+                return box_stmt(Stmt.SLocalDecl(self.parse_decl()))
+            case Token.KwInterface:
+                return box_stmt(Stmt.SLocalDecl(self.parse_decl()))
+            case Token.KwExtend:
+                return box_stmt(Stmt.SLocalDecl(self.parse_decl()))
+            case Token.KwDef:
+                mut _ldline = self.cur_line()
+                mut _ldf = self.parse_function_def(False)
+                _ldf.line = _ldline
+                return box_stmt(Stmt.SLocalDecl(box_decl(Decl.DFunction(_ldf))))
             case _:
                 pass
         match self.peek():
             case Token.Ident(cs_nm):
+                if cs_nm == "type":
+                    # Local type alias: `type Name = ExistingType` inside a function.
+                    # Consume and emit as SPass - the alias is registered in the outer parse_decl path.
+                    # For local scopes we just need to parse and discard cleanly.
+                    self.pos = self.pos + 1
+                    mut _ta_name = self.consume_ident()
+                    if self.peek() == Token.Eq:
+                        self.pos = self.pos + 1
+                        mut _ta_ty = self.parse_type()
+                        self.expect_newline()
+                        return box_stmt(Stmt.SPass)
                 if cs_nm == "chan_select":
                     return self.parse_chan_select_stmt()
+                if cs_nm == "var":
+                    # `var` is an OPTIONAL, explicit variable-declaration marker: `var name
+                    # [: type] [= value]` parses exactly like the bare form (`var age: int` ≡
+                    # `age: int`). It is a CONTEXTUAL keyword — only special when followed by an
+                    # identifier (a declaration); everywhere else `var` stays a normal
+                    # identifier (`var = 5`, `var.x`, `f(var)`), so the compiler's own code and
+                    # user code that use `var` as a name keep working. (Like `type` above.)
+                    mut _var_save = self.pos
+                    self.pos = self.pos + 1
+                    match self.peek():
+                        case Token.Ident(_):
+                            return self.parse_assign_or_expr_stmt()   # parse the decl (var stripped)
+                        case _:
+                            self.pos = _var_save                       # `var` used as an identifier
             case _: pass
         return self.parse_assign_or_expr_stmt()
 
@@ -475,13 +702,16 @@ extend Parser:
                 case _:
                     pass
             mut body = self.parse_block()
-            mut body_ptr = alloc[Block](1)
-            body_ptr.write(body)
-            mut c = CatchClause.init(err_name, body_ptr)
+            mut c = CatchClause.init(err_name, Pointer[Block](0))
+            unsafe:
+                mut body_ptr = alloc[Block](1)
+                body_ptr.write(body)
+                c.body = body_ptr
             c.err_type = err_type
-            mut c_ptr = alloc[CatchClause](1)
-            c_ptr.write(c)
-            catches.push(c_ptr)
+            unsafe:
+                mut c_ptr = alloc[CatchClause](1)
+                c_ptr.write(c)
+                catches.push(c_ptr)
         
         mut finally_b = Block.init()
         if self.peek() == Token.KwFinally:
@@ -625,13 +855,13 @@ extend Parser:
                                 if self.peek() == Token.Colon: self.pos = self.pos + 1
                                 arm_kind = 2
                             else:
-                                # Could be: v = ch.recv() → recv arm
-                                # Or: ch.send(val)        → send arm
+                                # Could be: v = ch.recv() -> recv arm
+                                # Or: ch.send(val)        -> send arm
                                 mut saved = self.pos
                                 self.pos = self.pos + 1  # consume ident
                                 match self.peek():
                                     case Token.Eq:
-                                        # v = expr → recv arm: v = ch.recv()
+                                        # v = expr -> recv arm: v = ch.recv()
                                         self.pos = self.pos + 1
                                         chan_e = self.parse_expr()
                                         if self.peek() == Token.Colon: self.pos = self.pos + 1
@@ -649,16 +879,17 @@ extend Parser:
                             if self.peek() == Token.Colon: self.pos = self.pos + 1
                             arm_kind = 1
                     mut arm_body = self.parse_block()
-                    mut arm_p = alloc[ChanSelectArm](1)
-                    if arm_kind == 0:
-                        arm_p.write(ChanSelectArm.init_recv(chan_e, var_nm, arm_body))
-                    elif arm_kind == 1:
-                        arm_p.write(ChanSelectArm.init_send(chan_e, Pointer[Expr](0), arm_body))
-                    elif arm_kind == 2:
-                        arm_p.write(ChanSelectArm.init_timeout(timeout_e, arm_body))
-                    else:
-                        arm_p.write(ChanSelectArm.init_default(arm_body))
-                    cases.push(arm_p)
+                    unsafe:
+                        mut arm_p = alloc[ChanSelectArm](1)
+                        if arm_kind == 0:
+                            arm_p.write(ChanSelectArm.init_recv(chan_e, var_nm, arm_body))
+                        elif arm_kind == 1:
+                            arm_p.write(ChanSelectArm.init_send(chan_e, Pointer[Expr](0), arm_body))
+                        elif arm_kind == 2:
+                            arm_p.write(ChanSelectArm.init_timeout(timeout_e, arm_body))
+                        else:
+                            arm_p.write(ChanSelectArm.init_default(arm_body))
+                        cases.push(arm_p)
                 case Token.Dedent | Token.Eof:
                     going = false
                 case Token.Newline:
@@ -784,9 +1015,10 @@ extend Parser:
                         case _:
                             pass
                     eb = self.parse_block()
-                    mut eb_ptr = alloc[Block](1)
-                    eb_ptr.write(eb)
-                    elifs.push(ElifClause.init(ec, eb_ptr))
+                    unsafe:
+                        mut eb_ptr = alloc[Block](1)
+                        eb_ptr.write(eb)
+                        elifs.push(ElifClause.init(ec, eb_ptr))
                     going = True
                 case Token.KwElse:
                     self.pos = self.pos + 1
@@ -813,10 +1045,32 @@ extend Parser:
         body = self.parse_block()
         return box_stmt(Stmt.SWhile(cond, body, Vec[Decorator].init(0)))
 
+    # `loop:` statement — an infinite loop, equivalent to `while true:`.
+    pub def parse_loop_stmt(self) -> Pointer[Stmt]:
+        self.pos = self.pos + 1                    # consume 'loop'
+        self.skip_newlines()
+        if self.peek() == Token.Colon: self.pos = self.pos + 1
+        mut body = self.parse_block()
+        return box_stmt(Stmt.SWhile(box_expr(Expr.ELitBool(true)), body, Vec[Decorator].init(0)))
+
     pub def parse_for_stmt(self) -> Pointer[Stmt]:
         self.pos = self.pos + 1
-        var = self.consume_ident()
-        # Multi-target: for a, b in ... → SForUnpack
+        # `for mut ref x` / `for ref x` — borrow each element (zero-copy iteration; the
+        # loop body borrows the collection, so it can't be mutated mid-loop).
+        mut for_is_ref = false
+        if self.peek() == Token.KwMut:
+            self.pos = self.pos + 1
+            mut _mr = self.consume_ident()   # `ref`
+            for_is_ref = true
+        mut var = self.consume_ident()
+        if not for_is_ref and var == "ref":
+            match self.peek():
+                case Token.KwIn: pass
+                case Token.Comma: pass
+                case _:
+                    for_is_ref = true
+                    var = self.consume_ident()
+        # Multi-target: for a, b in ... -> SForUnpack
         if self.peek() == Token.Comma:
             mut unpack_vars = Vec[str].init(4)
             unpack_vars.push(var)
@@ -842,7 +1096,7 @@ extend Parser:
             case _:
                 pass
         body = self.parse_block()
-        return box_stmt(Stmt.SFor(var, iter_e, body, Vec[Decorator].init(0)))
+        return box_stmt(Stmt.SFor(var, iter_e, body, Vec[Decorator].init(0), for_is_ref))
 
     pub def parse_match_stmt(self) -> Pointer[Stmt]:
         self.pos = self.pos + 1
@@ -853,6 +1107,12 @@ extend Parser:
                 self.pos = self.pos + 1
             case _:
                 pass
+        mut arms = self.parse_match_arms()
+        return box_stmt(Stmt.SMatch(subj, arms))
+
+    # Parse the indented arm list of a `match` (shared by statement and the
+    # `match` block-expression). Assumes the leading `match subj:` is consumed.
+    pub def parse_match_arms(self) -> Vec[MatchArm]:
         self.skip_newlines()
         match self.peek():
             case Token.Indent:
@@ -864,7 +1124,10 @@ extend Parser:
         while going:
             self.skip_newlines()
             match self.peek():
-                case Token.Dedent | Token.Eof:
+                # Stop at a dedent/EOF, or at a closing bracket when this match is
+                # a block-EXPRESSION whose `)` / `]` / `}` sits on the final arm's
+                # line (the lexer's bracket-suspend may not emit a closing Dedent).
+                case Token.Dedent | Token.Eof | Token.RParen | Token.RBracket | Token.RBrace:
                     going = False
                 case _:
                     pass
@@ -877,6 +1140,11 @@ extend Parser:
                         self.pos = self.pos + 1
                         or_pats.push(self.parse_pattern())
                     pat = Pattern.POr(or_pats)
+                # Pattern matching guard: `case Pattern if condition:`
+                mut guard_expr = Pointer[Expr](0)
+                if self.peek() == Token.KwIf:
+                    self.pos = self.pos + 1
+                    guard_expr = self.parse_expr()
                 match self.peek():
                     case Token.Colon:
                         self.pos = self.pos + 1
@@ -892,15 +1160,19 @@ extend Parser:
                         pass
                 if not is_block_arm:
                     arm_block.push(self.parse_stmt())
-                mut ab_ptr = alloc[Block](1)
-                ab_ptr.write(arm_block)
-                arms.push(MatchArm.init(pat, ab_ptr))
+                mut ab_ptr = Pointer[Block](0)
+                unsafe:
+                    ab_ptr = alloc[Block](1)
+                    ab_ptr.write(arm_block)
+                mut new_arm = MatchArm.init(pat, ab_ptr)
+                new_arm.guard = guard_expr
+                arms.push(new_arm)
         match self.peek():
             case Token.Dedent:
                 self.pos = self.pos + 1
             case _:
                 pass
-        return box_stmt(Stmt.SMatch(subj, arms))
+        return arms
 
     pub def parse_pattern(self) -> Pattern:
         match self.peek():
@@ -1041,7 +1313,84 @@ extend Parser:
         return box_stmt(Stmt.SExpr(lhs))
 
     pub def parse_expr(self) -> Pointer[Expr]:
+        # Block-expression forms in expression position (RHS of let/assign,
+        # return value, argument): `do:` runs a block and yields its last bare
+        # expression. (if/match/loop/while as expressions build on this.)
+        if self.peek() == Token.KwDo:
+            self.pos = self.pos + 1            # consume 'do'
+            if self.peek() == Token.Colon: self.pos = self.pos + 1
+            mut do_body = self.parse_block()
+            return box_expr(Expr.EDo(do_body))
+        # Prefix `if … :` block in expression position is an if-EXPRESSION whose
+        # branches each yield their last bare expression. It lowers to a ternary
+        # of `do:` blocks (EIfElse of EDo), reusing the do-block value machinery.
+        # (Statement `if` is dispatched in parse_stmt; the postfix `a if c else b`
+        # ternary is reached via parse_ternary after parsing its left operand, so
+        # this hook only fires when `if` is the FIRST token of an expression.)
+        if self.peek() == Token.KwIf:
+            return self.parse_if_expr()
+        # Prefix `match … :` block in expression position is a match-EXPRESSION:
+        # each arm's last bare expression is its value. (Statement `match` is
+        # dispatched in parse_stmt, so this only fires in expression position.)
+        if self.peek() == Token.KwMatch:
+            return self.parse_match_expr()
+        # `loop:` / `while c:` in expression position: the value comes from a
+        # `break <value>` inside the body (and, for `while`, the optional `else:`
+        # block on normal exit). Statement loops are dispatched in parse_stmt.
+        if self.peek() == Token.KwLoop:
+            self.pos = self.pos + 1                # consume 'loop'
+            self.skip_newlines()
+            if self.peek() == Token.Colon: self.pos = self.pos + 1
+            mut loop_body = self.parse_block()
+            return box_expr(Expr.ELoop(loop_body))
+        if self.peek() == Token.KwWhile:
+            self.pos = self.pos + 1                # consume 'while'
+            mut we_cond = self.parse_expr()
+            self.skip_newlines()
+            if self.peek() == Token.Colon: self.pos = self.pos + 1
+            mut we_body = self.parse_block()
+            mut we_else = Block.init()
+            self.skip_newlines()
+            if self.peek() == Token.KwElse:
+                self.pos = self.pos + 1
+                self.skip_newlines()
+                if self.peek() == Token.Colon: self.pos = self.pos + 1
+                we_else = self.parse_block()
+            return box_expr(Expr.EWhileExpr(we_cond, we_body, we_else))
         return self.parse_ternary()
+
+    pub def parse_match_expr(self) -> Pointer[Expr]:
+        self.pos = self.pos + 1                    # consume 'match'
+        mut subj = self.parse_expr()
+        self.skip_newlines()
+        if self.peek() == Token.Colon: self.pos = self.pos + 1
+        mut arms = self.parse_match_arms()
+        return box_expr(Expr.EMatch(subj, arms))
+
+    # Parse `if cond: <block> (elif cond: <block>)* else: <block>` as an
+    # expression. Each branch becomes an `EDo` (its last bare expression is the
+    # value); elif/else chain nests into the else arm. `else` is required for a
+    # well-defined value, but a missing else yields an empty (void) do-block.
+    pub def parse_if_expr(self) -> Pointer[Expr]:
+        self.pos = self.pos + 1                    # consume 'if' or 'elif'
+        mut cond = self.parse_expr()
+        self.skip_newlines()
+        if self.peek() == Token.Colon: self.pos = self.pos + 1
+        mut then_b = self.parse_block()
+        mut then_e = box_expr(Expr.EDo(then_b))
+        self.skip_newlines()
+        mut else_e = box_expr(Expr.EDo(Block.init()))
+        match self.peek():
+            case Token.KwElif:
+                else_e = self.parse_if_expr()      # recurse: consumes 'elif'
+            case Token.KwElse:
+                self.pos = self.pos + 1
+                self.skip_newlines()
+                if self.peek() == Token.Colon: self.pos = self.pos + 1
+                mut else_b = self.parse_block()
+                else_e = box_expr(Expr.EDo(else_b))
+            case _: pass
+        return box_expr(Expr.EIfElse(cond, then_e, else_e))
 
     pub def parse_ternary(self) -> Pointer[Expr]:
         mut left = self.parse_or_expr()
@@ -1093,34 +1442,38 @@ extend Parser:
                 self.pos = self.pos + 1
                 return box_expr(Expr.EUnaryOp("not", box_expr(Expr.EBinOp("in", left, self.parse_bitor_expr()))))
             self.pos = saved_pos
+        # Comparison chain: `a < b < c` desugars to `(a < b) and (b < c)` (Python-style).
+        # A single comparison is the common case (chain of length 1).
+        mut operands = Vec[Pointer[Expr]].init(4)
+        operands.push(left)
+        mut ops = Vec[str].init(4)
+        while true:
+            mut op = self._peek_cmp_op()
+            if op == "": break
+            self.pos = self.pos + 1
+            ops.push(op)
+            operands.push(self.parse_bitor_expr())
+            if op == "is" or op == "in": break   # is/in don't chain further
+        if ops.len == 0: return left
+        mut result = box_expr(Expr.EBinOp(ops.get(0), operands.get(0), operands.get(1)))
+        mut ci = 1
+        while ci < ops.len:
+            mut cmp = box_expr(Expr.EBinOp(ops.get(ci), operands.get(ci), operands.get(ci + 1)))
+            result = box_expr(Expr.EBinOp("and", result, cmp))
+            ci = ci + 1
+        return result
+
+    def _peek_cmp_op(self) -> str:
         match self.peek():
-            case Token.EqEq:
-                self.pos = self.pos + 1
-                left = box_expr(Expr.EBinOp("==", left, self.parse_bitor_expr()))
-            case Token.NotEq:
-                self.pos = self.pos + 1
-                left = box_expr(Expr.EBinOp("!=", left, self.parse_bitor_expr()))
-            case Token.Lt:
-                self.pos = self.pos + 1
-                left = box_expr(Expr.EBinOp("<", left, self.parse_bitor_expr()))
-            case Token.Gt:
-                self.pos = self.pos + 1
-                left = box_expr(Expr.EBinOp(">", left, self.parse_bitor_expr()))
-            case Token.LtEq:
-                self.pos = self.pos + 1
-                left = box_expr(Expr.EBinOp("<=", left, self.parse_bitor_expr()))
-            case Token.GtEq:
-                self.pos = self.pos + 1
-                left = box_expr(Expr.EBinOp(">=", left, self.parse_bitor_expr()))
-            case Token.KwIs:
-                self.pos = self.pos + 1
-                left = box_expr(Expr.EBinOp("is", left, self.parse_bitor_expr()))
-            case Token.KwIn:
-                self.pos = self.pos + 1
-                left = box_expr(Expr.EBinOp("in", left, self.parse_bitor_expr()))
-            case _:
-                pass
-        return left
+            case Token.EqEq: return "=="
+            case Token.NotEq: return "!="
+            case Token.Lt: return "<"
+            case Token.Gt: return ">"
+            case Token.LtEq: return "<="
+            case Token.GtEq: return ">="
+            case Token.KwIs: return "is"
+            case Token.KwIn: return "in"
+            case _: return ""
 
     pub def parse_bitor_expr(self) -> Pointer[Expr]:
         mut left = self.parse_bitxor_expr()
@@ -1233,15 +1586,44 @@ extend Parser:
                     self.pos = self.pos + 1
                     e = box_expr(Expr.ECall(e, self.parse_arg_list()))
                 case Token.LBracket:
+                    mut ix_oln = self.cur_line()
+                    mut ix_ocol = self.cur_col()
                     self.pos = self.pos + 1
-                    mut idx = self.parse_expr()
-                    # Consume extra comma-separated type args (e.g. Map[str, T])
+                    # A generic argument that is itself a function-pointer type
+                    # (e.g. `Vec[def(HttpConn) -> bool].init(4)`) cannot be
+                    # parsed as a value expression - `def` doesn't start one.
+                    # Parse it as a type and carry it via ETypeArg.
+                    mut idx: Pointer[Expr] = 0 as Pointer[Expr]
+                    if self.peek() == Token.KwDef:
+                        idx = box_expr(Expr.ETypeArg(box_asttype(self.parse_type())))
+                    else:
+                        idx = self.parse_expr()
+                    # Collect extra comma-separated type args (e.g. Map[str, T]).
+                    # A subsequent arg may itself be a function-pointer type
+                    # (e.g. `Map[str, def(int) -> bool].init(4)`), which `def`
+                    # cannot start as a value expression - parse it as a type.
+                    # These were previously PARSED AND DISCARDED, which collapsed
+                    # `Map[K, V]` to `Map[K]` and lost the value type V (so the
+                    # codegen couldn't tell a Map[*,str] needed the strval free
+                    # path -> leak). Keep them: a multi-arg index becomes an
+                    # ETuple of all the type args, which the type lowering reads.
+                    mut _ti_extra = Vec[Pointer[Expr]].init(2)
                     while self.peek() == Token.Comma:
                         self.pos = self.pos + 1
                         self.skip_newlines_and_indent()
-                        self.parse_expr()
-                    if self.peek() == Token.RBracket:
-                        self.pos = self.pos + 1
+                        if self.peek() == Token.KwDef:
+                            _ti_extra.push(box_expr(Expr.ETypeArg(box_asttype(self.parse_type()))))
+                        else:
+                            _ti_extra.push(self.parse_expr())
+                    self.expect_rbracket(ix_oln, ix_ocol, "this index")
+                    if _ti_extra.len > 0:
+                        mut _ti_all = Vec[Pointer[Expr]].init(_ti_extra.len + 1)
+                        _ti_all.push(idx)
+                        mut _tj = 0
+                        while _tj < _ti_extra.len:
+                            _ti_all.push(_ti_extra.get(_tj))
+                            _tj = _tj + 1
+                        idx = box_expr(Expr.ETuple(_ti_all))
                     e = box_expr(Expr.EIndex(e, idx))
                 case Token.Question:
                     self.pos = self.pos + 1
@@ -1252,7 +1634,61 @@ extend Parser:
                 case _: break
         return e
 
+    # Render a diagnostic at an EXPLICIT location (line/col) rather than the
+    # current token. Used to point an "unclosed delimiter" error back at the
+    # OPENING bracket, not at end-of-file where the parser finally gives up.
+    pub def emit_diag_at(self, ln: int, col: int, msg: str, hint: str):
+        print(c_red("error") + ": " + c_bold(msg))
+        mut loc = ""
+        if self.current_file.len() > 0:
+            loc = self.current_file
+        mut head = loc + ":" + str(ln)
+        if col > 0:
+            head = head + ":" + str(col)
+        print("  " + c_cyan("-->") + " " + head)
+        if self.src_text.len() > 0 and ln > 0:
+            mut srcline = _nth_source_line(self.src_text, ln)
+            if srcline.len() > 0:
+                mut gnum = "   " + str(ln) + " | "
+                mut gbar = _spaces(gnum.len() - 2) + "| "
+                print(c_dim(gnum) + srcline)
+                if col > 0:
+                    print(c_dim(gbar) + _spaces(col - 1) + c_red("^"))
+        if hint.len() > 0:
+            print("  " + c_green("= help") + ": " + hint)
+        self.error_count = self.error_count + 1
+
+    # Consume an expected closing bracket, or emit a fatal diagnostic pointing at
+    # the OPENING bracket (oln:ocol). Silently skipping a missing closer (the old
+    # behavior) let malformed source — e.g. an unclosed `(` — slip through to the
+    # C backend instead of stopping here.
+    pub def expect_rparen(self, oln: int, ocol: int, what: str):
+        match self.peek():
+            case Token.RParen:
+                self.pos = self.pos + 1
+            case _:
+                self.emit_diag_at(oln, ocol, "unclosed '(' — " + what + " is never closed", "add the matching ')'.")
+    pub def expect_rbracket(self, oln: int, ocol: int, what: str):
+        match self.peek():
+            case Token.RBracket:
+                self.pos = self.pos + 1
+            case _:
+                self.emit_diag_at(oln, ocol, "unclosed '[' — " + what + " is never closed", "add the matching ']'.")
+    pub def expect_rbrace(self, oln: int, ocol: int, what: str):
+        match self.peek():
+            case Token.RBrace:
+                self.pos = self.pos + 1
+            case _:
+                self.emit_diag_at(oln, ocol, "unclosed '{' — " + what + " is never closed", "add the matching '}'.")
+
     pub def parse_arg_list(self) -> Vec[Pointer[Expr]]:
+        # The caller already consumed the '(' — point an unclosed-call error back
+        # at it (the token at pos-1), not at wherever parsing finally stops.
+        mut oln = 0
+        mut ocol = 0
+        if self.pos > 0:
+            oln = self.lines.get(self.pos - 1)
+            ocol = self.cols.get(self.pos - 1)
         mut el = Vec[Pointer[Expr]].init(4)
         mut going = True
         while going:
@@ -1270,11 +1706,7 @@ extend Parser:
                         self.skip_newlines_and_indent()
                     case _:
                         going = False
-        match self.peek():
-            case Token.RParen:
-                self.pos = self.pos + 1
-            case _:
-                pass
+        self.expect_rparen(oln, ocol, "this call's argument list")
         return el
 
     pub def parse_primary(self) -> Pointer[Expr]:
@@ -1373,6 +1805,14 @@ extend Parser:
                 return box_expr(Expr.EIdent("super"))
             case Token.Ident(name):
                 self.pos = self.pos + 1
+                # Function-like macro call: `name!(args)`. Expanded at compile time
+                # into the macro's returned source (parsed as an expression).
+                if self.peek() == Token.Bang:
+                    self.pos = self.pos + 1            # consume '!'
+                    if self.peek() == Token.LParen:
+                        self.pos = self.pos + 1        # consume '('
+                        mut mac_args = self.parse_arg_list()
+                        return box_expr(Expr.EMacroCall(name, mac_args))
                 return box_expr(Expr.EIdent(name))
             case Token.KwSizeOf:
                 self.pos = self.pos + 1
@@ -1389,6 +1829,8 @@ extend Parser:
                         pass
                 return box_expr(Expr.ESizeOf(ty))
             case Token.LParen:
+                mut p_oln = self.cur_line()
+                mut p_ocol = self.cur_col()
                 self.pos = self.pos + 1
                 self.skip_newlines()
                 if self.peek() == Token.RParen:
@@ -1406,21 +1848,17 @@ extend Parser:
                         self.skip_newlines()
                         if self.peek() == Token.Comma:
                             self.pos = self.pos + 1
-                        self.skip_newlines()
-                    match self.peek():
-                        case Token.RParen:
-                            self.pos = self.pos + 1
-                        case _:
-                            pass
+                            self.skip_newlines()
+                        else:
+                            break
+                    self.expect_rparen(p_oln, p_ocol, "this tuple")
                     return box_expr(Expr.ETuple(items))
                 else:
-                    match self.peek():
-                        case Token.RParen:
-                            self.pos = self.pos + 1
-                        case _:
-                            pass
+                    self.expect_rparen(p_oln, p_ocol, "this parenthesized expression")
                     return e
             case Token.LBracket:
+                mut lb_oln = self.cur_line()
+                mut lb_ocol = self.cur_col()
                 self.pos = self.pos + 1
                 self.skip_newlines()
                 if self.peek() == Token.RBracket:
@@ -1445,14 +1883,11 @@ extend Parser:
                             ifs.push(self.parse_or_expr())
                         mut c = Comprehension.init(target, iter)
                         c.ifs = ifs
-                        mut c_ptr = alloc[Comprehension](1)
-                        c_ptr.write(c)
-                        generators.push(c_ptr)
-                    match self.peek():
-                        case Token.RBracket:
-                            self.pos = self.pos + 1
-                        case _:
-                            pass
+                        unsafe:
+                            mut c_ptr = alloc[Comprehension](1)
+                            c_ptr.write(c)
+                            generators.push(c_ptr)
+                    self.expect_rbracket(lb_oln, lb_ocol, "this list comprehension")
                     return box_expr(Expr.EListComp(first, generators))
                 mut items = Vec[Pointer[Expr]].init(2)
                 items.push(first)
@@ -1464,14 +1899,14 @@ extend Parser:
                         self.skip_newlines()
                         if self.peek() == Token.Comma:
                             self.pos = self.pos + 1
-                        self.skip_newlines()
-                match self.peek():
-                    case Token.RBracket:
-                        self.pos = self.pos + 1
-                    case _:
-                        pass
+                            self.skip_newlines()
+                        else:
+                            break
+                self.expect_rbracket(lb_oln, lb_ocol, "this list")
                 return box_expr(Expr.EList(items))
             case Token.LBrace:
+                mut br_oln = self.cur_line()
+                mut br_ocol = self.cur_col()
                 self.pos = self.pos + 1
                 self.skip_newlines()
                 mut keys = Vec[Pointer[Expr]].init(2)
@@ -1525,11 +1960,7 @@ extend Parser:
                                 break
                             self.skip_newlines()
                 self.skip_newlines()
-                match self.peek():
-                    case Token.RBrace:
-                        self.pos = self.pos + 1
-                    case _:
-                        pass
+                self.expect_rbrace(br_oln, br_ocol, "this dict/set literal")
                 if is_set:
                     return box_expr(Expr.ESet(set_items))
                 else:
@@ -1582,25 +2013,50 @@ extend Parser:
             case _:
                 pass
         if not self.at_end():
-            mut tok_name = "unknown"
+            mut tok_desc = "token"
+            mut hint = "check for a typo, a missing ':' or unbalanced parentheses/brackets near this point."
             match self.peek():
-                case Token.Newline: tok_name = "Newline"
-                case Token.Indent: tok_name = "Indent"
-                case Token.Dedent: tok_name = "Dedent"
-                case Token.Ident(n): tok_name = "Ident:" + n
-                case Token.KwMut: tok_name = "KwMut"
-                case Token.KwConst: tok_name = "KwConst"
-                case Token.KwPub: tok_name = "KwPub"
-                case Token.KwReturn: tok_name = "KwReturn"
-                case Token.KwIf: tok_name = "KwIf"
-                case Token.KwWhile: tok_name = "KwWhile"
-                case Token.Comma: tok_name = "Comma"
-                case Token.Colon: tok_name = "Colon"
-                case Token.RParen: tok_name = "RParen"
-                case Token.RBracket: tok_name = "RBracket"
-                case Token.RBrace: tok_name = "RBrace"
-                case _: tok_name = "other"
-            print("Parser error: unexpected token=" + tok_name + " at pos=" + self.pos.to_str())
+                case Token.Newline:
+                    tok_desc = "end of line"
+                    hint = "an expression was expected before the end of this line - check for a missing value or trailing operator."
+                case Token.Indent:
+                    tok_desc = "indentation"
+                    hint = "check that this line's indentation matches the surrounding block."
+                case Token.Dedent:
+                    tok_desc = "dedent"
+                    hint = "check that this block is properly indented and closed."
+                case Token.Ident(n):
+                    tok_desc = "identifier '" + n + "'"
+                    hint = "an operator, ':' or end of statement was expected before '" + n + "'."
+                case Token.KwMut: tok_desc = "keyword 'mut'"
+                case Token.KwConst: tok_desc = "keyword 'const'"
+                case Token.KwPub: tok_desc = "keyword 'pub'"
+                case Token.KwReturn: tok_desc = "keyword 'return'"
+                case Token.KwIf: tok_desc = "keyword 'if'"
+                case Token.KwWhile: tok_desc = "keyword 'while'"
+                case Token.Comma:
+                    tok_desc = "','"
+                    hint = "remove the extra ',' or add the missing item before it."
+                case Token.Colon:
+                    tok_desc = "':'"
+                    hint = "remove the extra ':' or check the statement before it is complete."
+                case Token.RParen:
+                    tok_desc = "')'"
+                    hint = "check for an extra ')' or a missing matching '('."
+                case Token.RBracket:
+                    tok_desc = "']'"
+                    hint = "check for an extra ']' or a missing matching '['."
+                case Token.RBrace:
+                    tok_desc = "'}'"
+                    hint = "check for an extra '}' or a missing matching '{'."
+                case Token.Error(em):
+                    # A lexer-level error (unknown char, inconsistent indentation):
+                    # report its own message verbatim rather than "unexpected token".
+                    self.emit_diag(em, "")
+                    self.pos = self.pos + 1
+                    return box_expr(Expr.ELitNone)
+                case _: pass
+            self.emit_diag("unexpected " + tok_desc + " in expression", hint)
             self.pos = self.pos + 1
         return box_expr(Expr.ELitNone)
 
@@ -1631,15 +2087,25 @@ extend Parser:
                     if depth > 0: expr_sb.append_char(ec)
                     i = i + 1
                 
-                # Parse the expression inside {}
-                mut expr_str = expr_sb.to_string().as_str()
+                # Parse the expression inside {}.
+                # Detect optional format spec: {expr:spec}  e.g. {x:.2f} {n:>10}
+                mut expr_str  = expr_sb.to_string().as_str()
+                mut fmt_spec  = ""
+                mut colon_pos = _find_fmt_colon(expr_str)
+                if colon_pos >= 0:
+                    mut _fs = expr_str.slice(colon_pos + 1, expr_str.len())
+                    fmt_spec = _fs.trim()
+                    mut _es = expr_str.slice(0, colon_pos)
+                    expr_str = _es.trim()
                 mut lexer = Lexer.init(expr_str)
                 mut _fstr_tokens = lexer.tokenize()
-                # Remove EOF from tokens before parsing expression
                 if _fstr_tokens.len > 0:
                     mut parser = Parser.init(_fstr_tokens, lexer.token_lines)
                     mut e = parser.parse_expr()
-                    fl.push(FStringPart.init_expr(e))
+                    if fmt_spec.len() > 0:
+                        fl.push(FStringPart.init_expr_fmt(e, fmt_spec))
+                    else:
+                        fl.push(FStringPart.init_expr(e))
             else:
                 sb.append_char(c)
                 i = i + 1
@@ -1653,7 +2119,23 @@ extend Parser:
         mut prog = Program.init()
         self.skip_newlines_and_indent()
         while not self.at_end():
-            self.skip_newlines_and_indent()
+            # Skip blank lines and block-closing dedents between top-level items.
+            # A stray INDENT here means a declaration/statement is indented under
+            # nothing (no `:`-opened block above it) — a fatal structural error,
+            # not something to silently swallow.
+            mut sk = True
+            while sk:
+                sk = False
+                match self.peek():
+                    case Token.Newline | Token.Dedent:
+                        self.pos = self.pos + 1
+                        sk = True
+                    case Token.Indent:
+                        self.emit_diag("unexpected indentation", "this line is indented but no block was opened above it (a statement ending in ':' and its own line) — remove the extra indentation.")
+                        self.pos = self.pos + 1
+                        sk = True
+                    case _:
+                        pass
             if not self.at_end():
                 prog.push(self.parse_decl())
         return prog
@@ -1671,23 +2153,45 @@ extend Parser:
             self.expect_newline()
 
         mut is_public = False
-        match self.peek():
-            case Token.KwPub:
-                is_public = True
-                self.pos = self.pos + 1
-        
-            case _:
-                pass
+        mut is_export = False
+        # Leading visibility modifiers: `pub` and/or `export` in any order.
+        # `export` implies public (the symbol must be visible to be exported).
+        mut _scan_mods = True
+        while _scan_mods:
+            _scan_mods = False
+            match self.peek():
+                case Token.KwPub:
+                    is_public = True
+                    self.pos = self.pos + 1
+                    _scan_mods = True
+                case Token.KwExport:
+                    is_export = True
+                    is_public = True
+                    self.pos = self.pos + 1
+                    _scan_mods = True
+                case _:
+                    pass
         match self.peek():
             case Token.KwFrom:
                 return self.parse_from_import()
             case Token.KwImport:
                 return self.parse_import()
+            case Token.Ident(type_kw):
+                # `type Name = ExistingType` - type alias declaration
+                if type_kw == "type":
+                    self.pos = self.pos + 1
+                    mut alias_name = self.consume_ident()
+                    if self.peek() == Token.Eq:
+                        self.pos = self.pos + 1
+                        mut target_ty = self.parse_type()
+                        self.expect_newline()
+                        return box_decl(Decl.DTypeAlias(alias_name, box_asttype(target_ty)))
             case Token.KwDef:
                 mut _fline = self.cur_line()
                 mut f = self.parse_function_def(False)
                 f.line = _fline
                 f.is_public = is_public
+                f.is_export = is_export
                 f.decorators = decorators
                 return box_decl(Decl.DFunction(f))
             case Token.KwClass:
@@ -1697,9 +2201,21 @@ extend Parser:
                     case Decl.DClass(c):
                         c.line = _cline
                         c.is_public = is_public
-                        c.is_class = true
+                        # @value_type marks a class as a stack VALUE type (no heap
+                        # box, no refcount, passed/returned by value — like Rust's
+                        # &str fat pointer). Everything else is a heap reference type.
+                        # @packed / @aligned(N) / @union describe a C-ABI struct layout, which
+                        # is inherently a stack VALUE type (a union with a refcount header would
+                        # be corrupt), so they imply @value_type — no __rc, passed/returned by value.
+                        mut _is_vt = false
+                        mut _dvi = 0
+                        while _dvi < decorators.len:
+                            mut _dvn = decorators.get(_dvi).name
+                            if _dvn == "value_type" or _dvn == "packed" or _dvn == "aligned" or _dvn == "union": _is_vt = true
+                            _dvi = _dvi + 1
+                        c.is_class = not _is_vt
                         c.decorators = decorators
-                        c_ptr.write(Decl.DClass(c))
+                        unsafe: c_ptr.write(Decl.DClass(c))
                     case _:
                         pass
                 return c_ptr
@@ -1711,7 +2227,7 @@ extend Parser:
                         e.line = _eline
                         e.is_public = is_public
                         e.decorators = decorators
-                        e_ptr.write(Decl.DEnum(e))
+                        unsafe: e_ptr.write(Decl.DEnum(e))
                     case _:
                         pass
                 return e_ptr
@@ -1722,7 +2238,8 @@ extend Parser:
                     case Decl.DInterface(i):
                         i.line = _iline
                         i.is_public = is_public
-                        i_ptr.write(Decl.DInterface(i))
+                        i.decorators = decorators
+                        unsafe: i_ptr.write(Decl.DInterface(i))
                     case _:
                         pass
                 return i_ptr
@@ -1735,6 +2252,17 @@ extend Parser:
                 _df.line = _dl
                 _df.is_public = is_public
                 return box_decl(Decl.DDecoratorDef(_df))
+            case Token.KwMacro:
+                # `macro def name(item) -> code:` — a compile-time code-generating
+                # macro. Parsed like a decorator def (reuses DDecoratorDef) but
+                # flagged is_macro; expanded before sema by expand_macros().
+                self.pos = self.pos + 1   # consume 'macro'
+                mut _ml = self.cur_line()
+                mut _mf = self.parse_function_def(False)
+                _mf.line = _ml
+                _mf.is_public = is_public
+                _mf.is_macro = true
+                return box_decl(Decl.DDecoratorDef(_mf))
             case Token.KwExtern:
                 return self.parse_extern_decl()
             case Token.KwAsync:
@@ -1744,6 +2272,7 @@ extend Parser:
                         mut f = self.parse_function_def(False)
                         f.is_async = True
                         f.is_public = is_public
+                        f.is_export = is_export
                         f.decorators = decorators
                         return box_decl(Decl.DFunction(f))
                     case _:
@@ -1755,9 +2284,9 @@ extend Parser:
     # Parse:
     #   from module import Name
     #   from module import Name as Alias
-    #   from module import (A, B as C, D)          ← parenthesised, single-line
-    #   from module import [A, B as C, D]           ← bracket list, single-line
-    #   from module import [                        ← bracket list, multi-line
+    #   from module import (A, B as C, D)          <- parenthesised, single-line
+    #   from module import [A, B as C, D]           <- bracket list, single-line
+    #   from module import [                        <- bracket list, multi-line
     #       A,
     #       B as C,
     #       D,
@@ -1798,20 +2327,31 @@ extend Parser:
                 case _:
                     pass
             if going:
-                mut item_name = self.consume_ident()
-                if item_name != "":
-                    mut item = ImportItem.init(item_name)
-                    # Optional per-item alias:  Name as Alias
-                    if self.peek() == Token.KwAs:
-                        self.pos = self.pos + 1
-                        item.alias = self.consume_ident()
-                    il.push(item)
+                # `from <module> import *` — wildcard: bring in ALL public names of the module.
+                # (In Tauraro's unity build a module import already exposes every `pub` decl, so
+                # `*` is recorded as a marker item and the resolver loads the whole module.)
+                if self.peek() == Token.Star:
+                    self.pos = self.pos + 1
+                    il.push(ImportItem.init("*"))
                     if self.peek() == Token.Comma:
                         self.pos = self.pos + 1
                     elif not multi:
                         going = false
                 else:
-                    going = false
+                    mut item_name = self.consume_ident()
+                    if item_name != "":
+                        mut item = ImportItem.init(item_name)
+                        # Optional per-item alias:  Name as Alias
+                        if self.peek() == Token.KwAs:
+                            self.pos = self.pos + 1
+                            item.alias = self.consume_ident()
+                        il.push(item)
+                        if self.peek() == Token.Comma:
+                            self.pos = self.pos + 1
+                        elif not multi:
+                            going = false
+                    else:
+                        going = false
         # Consume the closing ) or ]
         if multi:
             match self.peek():
@@ -1835,6 +2375,19 @@ extend Parser:
         self.expect_newline()
         return box_decl(Decl.DImport(path, alias))
 
+    # Parse an optional bound clause after a generic param name: `T: Show` or
+    # `T: Show + Ord`. Records a GenericConstraint (target=gname, bounds=[interfaces])
+    # when present; a bare `T` records nothing. The bound types are plain names.
+    pub def parse_generic_bound(self, gname: str, constraints: Vec[GenericConstraint]):
+        if self.peek() == Token.Colon:
+            self.pos = self.pos + 1
+            mut gc = GenericConstraint.init(gname)
+            gc.bounds.push(box_asttype(AstType.init(self.consume_ident())))
+            while self.peek() == Token.Plus:
+                self.pos = self.pos + 1
+                gc.bounds.push(box_asttype(AstType.init(self.consume_ident())))
+            constraints.push(gc)
+
     pub def parse_function_def(self, is_method: bool) -> FunctionDef:
         self.pos = self.pos + 1
         mut name = self.consume_ident()
@@ -1842,7 +2395,9 @@ extend Parser:
         if self.peek() == Token.LBracket:
             self.pos = self.pos + 1
             while self.peek() != Token.RBracket:
-                f.generics.push(self.consume_ident())
+                mut _gpn = self.consume_ident()
+                f.generics.push(_gpn)
+                self.parse_generic_bound(_gpn, f.constraints)
                 if self.peek() == Token.Comma:
                     self.pos = self.pos + 1
             if self.peek() == Token.RBracket:
@@ -1862,9 +2417,75 @@ extend Parser:
             self.pos = self.pos + 1
             mut ret_t = self.parse_type()
             if self.peek() == Token.KwFrom:
+                # Region annotation on the return borrow. Single source `from a`, or
+                # multi-source `from a, b` (the returned ref is valid for the SHORTER
+                # of the named regions — their intersection). Stored comma-joined.
                 self.pos = self.pos + 1
                 ret_t.from_param = self.consume_ident()
+                ret_t.from_regions.push(ret_t.from_param)
+                while self.peek() == Token.Comma:
+                    self.pos = self.pos + 1
+                    mut rgn2 = self.consume_ident()
+                    ret_t.from_param = ret_t.from_param + "," + rgn2
+                    ret_t.from_regions.push(rgn2)
             f.ret_ty = box_asttype(ret_t)
+        # Gap 4: optional `where` outlives-bounds clause (optional parens, one or more).
+        # May sit on the signature line OR break to a continuation line, and the
+        # parenthesized form may span lines with a trailing comma:
+        #   where a outlives b
+        #   -> T from b \n    where a outlives b:
+        #   where (a outlives b, c outlives d)
+        #   where ( \n    a outlives b, \n    c outlives d, \n  ):
+        mut w_is = false
+        match self.peek():
+            case Token.Ident(wkw0):
+                if wkw0 == "where": w_is = true
+            case _: pass
+        if not w_is and self.peek() == Token.Newline:
+            # Continuation line: look past NEWLINE/INDENT for a `where` keyword.
+            # Consuming the leading INDENT lets the body (at the clause's indent)
+            # parse normally as the block opened by that indent.
+            mut scan = self.pos
+            mut scanning = true
+            while scanning:
+                match self.tokens.get(scan):
+                    case Token.Newline | Token.Indent:
+                        scan = scan + 1
+                    case _:
+                        scanning = false
+            match self.tokens.get(scan):
+                case Token.Ident(wkw1):
+                    if wkw1 == "where":
+                        w_is = true
+                        self.pos = scan
+                case _: pass
+        if w_is:
+            self.pos = self.pos + 1   # consume `where`
+            mut w_paren = false
+            if self.peek() == Token.LParen:
+                self.pos = self.pos + 1
+                w_paren = true
+                self.skip_newlines_and_indent()
+            mut w_more = true
+            while w_more:
+                if w_paren: self.skip_newlines_and_indent()
+                if w_paren and self.peek() == Token.RParen:
+                    w_more = false        # trailing comma before `)`
+                else:
+                    mut w_a  = self.consume_ident()    # region a
+                    mut w_kw = self.consume_ident()    # `outlives`
+                    mut w_b  = self.consume_ident()    # region b
+                    f.outlives_a.push(w_a)
+                    f.outlives_b.push(w_b)
+                    if w_paren: self.skip_newlines_and_indent()
+                    if w_paren and self.peek() == Token.Comma:
+                        self.pos = self.pos + 1
+                    else:
+                        w_more = false
+            if w_paren:
+                self.skip_newlines_and_indent()
+                if self.peek() == Token.RParen:
+                    self.pos = self.pos + 1
         if self.peek() == Token.Colon:
             self.pos = self.pos + 1
             f.body = self.parse_block()
@@ -1880,11 +2501,22 @@ extend Parser:
         if self.peek() == Token.LBracket:
             self.pos = self.pos + 1
             while self.peek() != Token.RBracket:
-                c.generics.push(self.consume_ident())
+                mut _cgpn = self.consume_ident()
+                c.generics.push(_cgpn)
+                self.parse_generic_bound(_cgpn, c.constraints)
                 if self.peek() == Token.Comma:
                     self.pos = self.pos + 1
             if self.peek() == Token.RBracket:
                 self.pos = self.pos + 1
+        # Region (lifetime) parameters: `class Parser from src:` — names the region
+        # this type's `ref`-typed fields borrow for. Parsed and accepted; field-level
+        # borrows + the M-2 move-while-borrowed check provide conservative enforcement.
+        if self.peek() == Token.KwFrom:
+            self.pos = self.pos + 1
+            c.region_params.push(self.consume_ident())
+            while self.peek() == Token.Comma:
+                self.pos = self.pos + 1
+                c.region_params.push(self.consume_ident())
         if self.peek() == Token.KwExtends:
             self.pos = self.pos + 1
             c.base_classes.push(self.consume_ident())
@@ -1903,8 +2535,54 @@ extend Parser:
                 if self.peek() == Token.Comma:
                     self.pos = self.pos + 1
                 else: break
+        # Detect an INLINE single-line body (`class X: pass`): a member follows the `:` on the
+        # same line, so the lexer emits no Indent/Dedent. Such a body must terminate at the end
+        # of the line — otherwise the indent-driven loop below runs to Dedent/Eof and swallows
+        # the following top-level block (its `case _` default eats tokens one at a time).
+        mut inline_body = False
         if self.peek() == Token.Colon:
             self.pos = self.pos + 1
+            match self.peek():
+                case Token.Newline | Token.Eof:
+                    pass
+                case _:
+                    inline_body = True
+        if inline_body:
+            mut inl = True
+            while inl:
+                mut in_pub = False
+                match self.peek():
+                    case Token.KwPub:
+                        in_pub = True
+                        self.pos = self.pos + 1
+                    case _:
+                        pass
+                match self.peek():
+                    case Token.KwPass:
+                        self.pos = self.pos + 1
+                    case Token.KwDef:
+                        mut _iml = self.cur_line()
+                        mut im = self.parse_function_def(True)
+                        im.line = _iml
+                        im.is_public = in_pub
+                        c.methods.push(im)
+                    case Token.Ident(ifn):
+                        self.pos = self.pos + 1
+                        mut ity = Pointer[AstType](0)
+                        if self.peek() == Token.Colon:
+                            self.pos = self.pos + 1
+                            ity = box_asttype(self.parse_type())
+                        c.fields.push(FieldDef.init(ifn, ity))
+                    case _:
+                        inl = False
+                match self.peek():
+                    case Token.Semicolon:
+                        self.pos = self.pos + 1
+                    case _:
+                        inl = False
+            if self.peek() == Token.Newline:
+                self.pos = self.pos + 1
+            return box_decl(Decl.DClass(c))
         self.skip_newlines()
         match self.peek():
             case Token.Indent:
@@ -1914,6 +2592,16 @@ extend Parser:
         mut going = True
         while going:
             self.skip_newlines()
+            # A triple-quoted string at the top of the class body is its
+            # docstring (captured for `inspect`), not an executable statement.
+            if c.docstring == "":
+                match self.peek():
+                    case Token.TripleStrLit(_ds):
+                        c.docstring = _ds
+                        self.pos = self.pos + 1
+                        self.skip_newlines()
+                    case _:
+                        pass
             mut decorators = Vec[Decorator].init(0)
             while self.peek() == Token.At:
                 self.pos = self.pos + 1
@@ -1960,7 +2648,21 @@ extend Parser:
                     mut ty_ptr = Pointer[AstType](0)
                     if self.peek() == Token.Colon:
                         self.pos = self.pos + 1
-                        ty_ptr = box_asttype(self.parse_type())
+                        mut fty = self.parse_type()
+                        # Field-level region: `text: ref str from src` — the field
+                        # borrows for region `src` (a class region param). The type
+                        # is already erased to its inner T (is_borrow set); record
+                        # the region name(s) for checking.
+                        if self.peek() == Token.KwFrom:
+                            self.pos = self.pos + 1
+                            fty.from_param = self.consume_ident()
+                            fty.from_regions.push(fty.from_param)
+                            while self.peek() == Token.Comma:
+                                self.pos = self.pos + 1
+                                mut frgn2 = self.consume_ident()
+                                fty.from_param = fty.from_param + "," + frgn2
+                                fty.from_regions.push(frgn2)
+                        ty_ptr = box_asttype(fty)
                     mut fld = FieldDef.init(fname, ty_ptr)
                     c.fields.push(fld)
                     self.expect_newline()
@@ -1977,6 +2679,15 @@ extend Parser:
         self.pos = self.pos + 1
         mut name = self.consume_ident()
         mut e = EnumDef.init(name)
+        # Region (lifetime) parameters: `enum Token from src:` — names the region
+        # variant payloads written `ref T from src` borrow for. Erased for codegen;
+        # only the L-2 region-name check (under --strict) consumes them.
+        if self.peek() == Token.KwFrom:
+            self.pos = self.pos + 1
+            e.region_params.push(self.consume_ident())
+            while self.peek() == Token.Comma:
+                self.pos = self.pos + 1
+                e.region_params.push(self.consume_ident())
         if self.peek() == Token.KwImplements:
             self.pos = self.pos + 1
             while True:
@@ -1984,8 +2695,42 @@ extend Parser:
                 if self.peek() == Token.Comma:
                     self.pos = self.pos + 1
                 else: break
+        # Inline single-line body (`enum E: A, B`): terminate at end of line, else the loop
+        # below runs to Dedent/Eof and swallows the following top-level block (see the class
+        # parser for the same fix).
+        mut e_inline = False
         if self.peek() == Token.Colon:
             self.pos = self.pos + 1
+            match self.peek():
+                case Token.Newline | Token.Eof:
+                    pass
+                case _:
+                    e_inline = True
+        if e_inline:
+            mut einl = True
+            while einl:
+                match self.peek():
+                    case Token.KwPass:
+                        self.pos = self.pos + 1
+                    case Token.Ident(evn):
+                        self.pos = self.pos + 1
+                        mut evd = VariantDef.init(evn)
+                        if self.peek() == Token.LParen:
+                            self.pos = self.pos + 1
+                            evd.fields = self.parse_param_list()
+                            if self.peek() == Token.RParen:
+                                self.pos = self.pos + 1
+                        e.variants.push(evd)
+                    case _:
+                        einl = False
+                match self.peek():
+                    case Token.Comma | Token.Semicolon:
+                        self.pos = self.pos + 1
+                    case _:
+                        einl = False
+            if self.peek() == Token.Newline:
+                self.pos = self.pos + 1
+            return box_decl(Decl.DEnum(e))
         self.skip_newlines()
         match self.peek():
             case Token.Indent:
@@ -2052,8 +2797,51 @@ extend Parser:
                 if gname != "": i.generics.push(gname)
                 if self.peek() == Token.Comma: self.pos = self.pos + 1
             if self.peek() == Token.RBracket: self.pos = self.pos + 1
+        # Region (lifetime) parameters: `interface View from r:` — method signatures
+        # may return `ref T from r`. Erased for codegen; drives the L-2 check.
+        if self.peek() == Token.KwFrom:
+            self.pos = self.pos + 1
+            i.region_params.push(self.consume_ident())
+            while self.peek() == Token.Comma:
+                self.pos = self.pos + 1
+                i.region_params.push(self.consume_ident())
+        # Inline single-line body (`interface I: pass`): terminate at end of line, else the
+        # loop below runs to Dedent/Eof and swallows the following top-level block.
+        mut i_inline = False
         if self.peek() == Token.Colon:
             self.pos = self.pos + 1
+            match self.peek():
+                case Token.Newline | Token.Eof:
+                    pass
+                case _:
+                    i_inline = True
+        if i_inline:
+            mut iinl = True
+            while iinl:
+                mut i_pub = False
+                match self.peek():
+                    case Token.KwPub:
+                        i_pub = True
+                        self.pos = self.pos + 1
+                    case _:
+                        pass
+                match self.peek():
+                    case Token.KwPass:
+                        self.pos = self.pos + 1
+                    case Token.KwDef:
+                        mut im2 = self.parse_function_def(True)
+                        im2.is_public = i_pub
+                        i.methods.push(im2)
+                    case _:
+                        iinl = False
+                match self.peek():
+                    case Token.Semicolon:
+                        self.pos = self.pos + 1
+                    case _:
+                        iinl = False
+            if self.peek() == Token.Newline:
+                self.pos = self.pos + 1
+            return box_decl(Decl.DInterface(i))
         self.skip_newlines()
         match self.peek():
             case Token.Indent:
@@ -2089,6 +2877,16 @@ extend Parser:
     pub def parse_extend_decl(self) -> Pointer[Decl]:
         self.pos = self.pos + 1
         mut target = self.consume_ident()
+        # Impl-block region (lifetime) re-declaration: `extend View from r:` —
+        # Rust's `impl<'a> View<'a>`. Accepted for surface symmetry; the regions
+        # the methods reference are already those of the extended type's decl, so
+        # the names are simply consumed (erased) here.
+        if self.peek() == Token.KwFrom:
+            self.pos = self.pos + 1
+            mut _erg = self.consume_ident()
+            while self.peek() == Token.Comma:
+                self.pos = self.pos + 1
+                _erg = self.consume_ident()
         if self.peek() == Token.Colon:
             self.pos = self.pos + 1
         self.skip_newlines()
@@ -2171,9 +2969,33 @@ extend Parser:
                 case Token.KwDef:
                     mut m = self.parse_function_def(False)
                     m.is_public = is_p
+                    # Trailing `args...` in an extern block matches C's `...`
+                    # variadic signature (e.g. `extern "C": def printf(fmt: str, args...)`
+                    # -> `int printf(char* fmt, ...)`), not a List[T] collection.
+                    if m.params.len > 0:
+                        mut _ext_last = m.params.get(m.params.len - 1)
+                        if _ext_last.is_variadic:
+                            m.params.pop()
+                            m.is_variadic = true
                     fl.push(m)
                 case _:
                     self.pos = self.pos + 1
         if self.peek() == Token.Dedent:
             self.pos = self.pos + 1
         return box_decl(Decl.DExtern(abi, fl))
+
+
+# -- f-string format spec helper -----------------------------------------------
+# Find the colon that separates {expr:spec}, skipping colons inside nested
+# brackets/parens (e.g. {dict["k"]:>10} should split at the outer colon).
+pub def _find_fmt_colon(s: str) -> int:
+    mut i = 0
+    mut n = s.len()
+    mut depth = 0
+    while i < n:
+        mut c = s.char_at(i)
+        if c == 40 or c == 91 or c == 123: depth = depth + 1  # ( [ {
+        elif c == 41 or c == 93 or c == 125: depth = depth - 1  # ) ] }
+        elif c == 58 and depth == 0: return i  # ':' at top level
+        i = i + 1
+    return -1

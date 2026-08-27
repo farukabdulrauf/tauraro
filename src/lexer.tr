@@ -1,36 +1,39 @@
-# compiler/src/lexer.tr — Tauraro lexer written in Tauraro.
+# @trusted: compiler systems module — audited raw-pointer core (like Rust std internals)
+# compiler/src/lexer.tr - Tauraro lexer written in Tauraro.
 # Tokenizes a source string into a Vec[Token].
 
 from token import Token
 from core.vec import Vec
 from core.string import StringBuilder
 
-# ─── Keyword table helper ───────────────────────────────────────────────────────
+# --- Keyword table helper -------------------------------------------------------
 
 pub def keyword_to_token(s: str) -> Token:
-    if s == "def" or s == "aiki":       return Token.KwDef
-    if s == "class" or s == "aji":     return Token.KwClass
+    if s == "def":                     return Token.KwDef
+    if s == "class":                   return Token.KwClass
     if s == "enum":                    return Token.KwEnum
     if s == "interface":               return Token.KwInterface
     if s == "extend":                  return Token.KwExtend
-    if s == "struct" or s == "tsari":  return Token.KwStruct
-    if s == "if" or s == "idan":       return Token.KwIf
-    if s == "elif" or s == "koidan":   return Token.KwElif
-    if s == "else" or s == "sai":      return Token.KwElse
-    if s == "for" or s == "ga":        return Token.KwFor
-    if s == "while" or s == "yayinda": return Token.KwWhile
-    if s == "return" or s == "dawo":   return Token.KwReturn
-    if s == "break" or s == "tsaya":   return Token.KwBreak
-    if s == "continue" or s == "ci_gaba": return Token.KwContinue
-    if s == "pass" or s == "wuce":     return Token.KwPass
-    if s == "match" or s == "duba":    return Token.KwMatch
-    if s == "case" or s == "hali":     return Token.KwCase
-    if s == "try" or s == "gwada":     return Token.KwTry
-    if s == "except" or s == "kama":   return Token.KwExcept
-    if s == "finally" or s == "karshe": return Token.KwFinally
-    if s == "raise" or s == "jefa":    return Token.KwRaise
-    if s == "assert" or s == "tabbatar": return Token.KwAssert
-    if s == "with" or s == "tare":     return Token.KwWith
+    if s == "struct":                  return Token.KwStruct
+    if s == "if":                      return Token.KwIf
+    if s == "elif":                    return Token.KwElif
+    if s == "else":                    return Token.KwElse
+    if s == "for":                     return Token.KwFor
+    if s == "while":                   return Token.KwWhile
+    if s == "loop":                    return Token.KwLoop
+    if s == "return":                  return Token.KwReturn
+    if s == "break":                   return Token.KwBreak
+    if s == "continue":                return Token.KwContinue
+    if s == "pass":                    return Token.KwPass
+    if s == "match":                   return Token.KwMatch
+    if s == "case":                    return Token.KwCase
+    if s == "try":                     return Token.KwTry
+    if s == "except":                  return Token.KwExcept
+    if s == "finally":                 return Token.KwFinally
+    if s == "raise":                   return Token.KwRaise
+    if s == "assert":                  return Token.KwAssert
+    if s == "with":                    return Token.KwWith
+    if s == "defer":                   return Token.KwDefer
     if s == "asm":                     return Token.KwAsm
     if s == "taskgroup" or s == "task_group": return Token.KwTaskGroup
     if s == "gpu":                     return Token.KwGpu
@@ -38,7 +41,7 @@ pub def keyword_to_token(s: str) -> Token:
     if s == "import":                  return Token.KwImport
     if s == "from":                    return Token.KwFrom
     if s == "as":                      return Token.KwAs
-    if s == "in" or s == "ciki" or s == "a_cikin": return Token.KwIn
+    if s == "in":                      return Token.KwIn
     if s == "mut":                     return Token.KwMut
     if s == "shared":                  return Token.KwShared
     if s == "extern":                  return Token.KwExtern
@@ -46,39 +49,41 @@ pub def keyword_to_token(s: str) -> Token:
     if s == "spawn":                   return Token.KwSpawn
     if s == "throws":                  return Token.KwThrows
     if s == "extends":                 return Token.KwExtends
-    if s == "async" or s == "ba_jira": return Token.KwAsync
-    if s == "await" or s == "jira":    return Token.KwAwait
-    if s == "yield" or s == "bayar":   return Token.KwYield
-    if s == "pub" or s == "fito":      return Token.KwPub
+    if s == "async":                   return Token.KwAsync
+    if s == "await":                   return Token.KwAwait
+    if s == "yield":                   return Token.KwYield
+    if s == "pub":                     return Token.KwPub
     if s == "static":                  return Token.KwStatic
     if s == "const":                   return Token.KwConst
     if s == "actor":                   return Token.KwActor
     if s == "super":                   return Token.KwSuper
     if s == "export":                  return Token.KwExport
-    if s == "lambda" or s == "dan_aiki": return Token.KwLambda
+    if s == "lambda":                  return Token.KwLambda
     if s == "decorator":               return Token.KwDecorator
+    if s == "macro":                   return Token.KwMacro
+    if s == "do":                      return Token.KwDo
     if s == "sizeof":                  return Token.KwSizeOf
     if s == "is":                      return Token.KwIs
-    
-    if s == "true" or s == "gaskiya" or s == "True": return Token.KwTrue
-    if s == "false" or s == "karya" or s == "False": return Token.KwFalse
-    if s == "none" or s == "babu" or s == "None":    return Token.KwNone
-    if s == "and" or s == "da":        return Token.KwAnd
-    if s == "or" or s == "ko":         return Token.KwOr
-    if s == "not" or s == "ba":        return Token.KwNot
+
+    if s == "true" or s == "True":     return Token.KwTrue
+    if s == "false" or s == "False":   return Token.KwFalse
+    if s == "none" or s == "None":     return Token.KwNone
+    if s == "and":                     return Token.KwAnd
+    if s == "or":                      return Token.KwOr
+    if s == "not":                     return Token.KwNot
 
     # Primitive types
-    if s == "int" or s == "lamba" or s == "i64": return Token.KwInt
-    if s == "float" or s == "f64":               return Token.KwFloat
-    if s == "bool":                              return Token.KwBool
-    if s == "char":                              return Token.KwChar
-    if s == "str" or s == "zuwa_rubutu":         return Token.KwStr
-    if s == "String":                            return Token.KwString
-    if s == "void":                              return Token.KwVoid
-    
+    if s == "int" or s == "i64":       return Token.KwInt
+    if s == "float" or s == "f64":     return Token.KwFloat
+    if s == "bool":                    return Token.KwBool
+    if s == "char":                    return Token.KwChar
+    if s == "str":                     return Token.KwStr
+    if s == "String":                  return Token.KwString
+    if s == "void":                    return Token.KwVoid
+
     return Token.Ident(s)
 
-# ─── Character helpers ──────────────────────────────────────────────────────────
+# --- Character helpers ----------------------------------------------------------
 
 pub def char_is_digit(c: int) -> bool:
     return c >= 48 and c <= 57   # '0' .. '9'
@@ -98,16 +103,28 @@ pub def char_is_newline(c: int) -> bool:
 pub def char_is_hex(c: int) -> bool:
     return char_is_digit(c) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102)
 
-# ─── Lexer class ────────────────────────────────────────────────────────────────
+# --- Lexer class ----------------------------------------------------------------
 
 pub class Lexer:
     pub src:    Pointer[char]   # raw source bytes
     pub len:    int             # total source length
     pub pos:    int             # current byte position
     pub line:   int             # 1-based line number
+    pub line_start: int         # byte offset of the current line's first char
+    pub tok_col: int            # 1-based column of the token currently being emitted
     pub indent_stack: Vec[int]  # stack of indent levels
     pub pending_dedents: int    # dedents to emit before next token
     pub token_lines: Vec[int]   # parallel line numbers for each token
+    pub token_cols: Vec[int]    # parallel 1-based columns for each token
+    # Comment capture (for `tauraroc fmt`): off by default so normal
+    # compilation pays nothing. When `record_comments` is set, each `#` comment
+    # is recorded with its line, text (after the '#'), and whether it trails
+    # code on the same line. Comments stay OUT of the token stream, so the
+    # parser/codegen are completely unaffected.
+    pub record_comments: bool
+    pub comment_lines:    Vec[int]
+    pub comment_texts:    Vec[str]
+    pub comment_trailing: Vec[bool]
 
     pub def init(source: str) -> Lexer:
         mut lx = Lexer()
@@ -121,13 +138,29 @@ pub class Lexer:
         lx.len = src_len
         lx.pos = 0
         lx.line = 1
+        lx.line_start = 0
+        lx.tok_col = 1
         lx.indent_stack = Vec[int].init(16)
         lx.indent_stack.push(0)   # base indent level = 0
         lx.pending_dedents = 0
         lx.token_lines = Vec[int].init(1024)
+        lx.token_cols = Vec[int].init(1024)
+        lx.record_comments = false
+        lx.comment_lines    = Vec[int].init(0)
+        lx.comment_texts    = Vec[str].init(0)
+        lx.comment_trailing = Vec[bool].init(0)
         return lx
 
-    # ── Token access helpers ──
+    # Push the source location (line + column) for the token just emitted.
+    # token_lines/token_cols stay parallel to the tokens Vec. The column is
+    # `tok_col`, captured at the start of the token (see tokenize). Diagnostic-
+    # only: never consumed by codegen, so a stale/approximate column for
+    # structural tokens (Indent/Dedent/Newline/Eof) is harmless.
+    pub def push_loc(self):
+        self.token_lines.push(self.line)
+        self.token_cols.push(self.tok_col)
+
+    # -- Token access helpers --
 
     pub def peek(self) -> int:
         if self.pos >= self.len:
@@ -142,17 +175,35 @@ pub class Lexer:
         unsafe:
             return self.src.offset(p).read() as int
 
+    # True if the rest of the current line (from self.pos) is blank — only
+    # spaces/tabs, then a comment, newline, or EOF. Used to detect a
+    # block-opening colon that sits at end-of-line.
+    pub def _at_eol_after_ws(self) -> bool:
+        mut k = 0
+        while True:
+            mut ch = self.peek_at(k)
+            if ch == 32 or ch == 9:
+                k = k + 1
+            else:
+                break
+        mut ch2 = self.peek_at(k)
+        if ch2 == 0: return True       # EOF
+        if ch2 == 35: return True      # comment
+        if char_is_newline(ch2): return True
+        return False
+
     pub def advance(self) -> int:
         mut c = self.peek()
+        self.pos = self.pos + 1
         if c == 10:
             self.line = self.line + 1
-        self.pos = self.pos + 1
+            self.line_start = self.pos   # first char of the new line
         return c
 
     pub def at_end(self) -> bool:
         return self.pos >= self.len
 
-    # ── Skip whitespace and comments (not newlines) ──
+    # -- Skip whitespace and comments (not newlines) --
 
     pub def skip_spaces(self):
         while not self.at_end():
@@ -162,9 +213,17 @@ pub class Lexer:
             else:
                 break
 
-    pub def skip_comment(self):
-        while not self.at_end() and not char_is_newline(self.peek()):
-            self.advance()
+    pub def skip_comment(self, trailing: bool):
+        if self.record_comments:
+            mut sb = StringBuilder.init(32)
+            while not self.at_end() and not char_is_newline(self.peek()):
+                sb.append_char(self.advance())
+            self.comment_lines.push(self.line)
+            self.comment_texts.push(sb.to_string().as_str())
+            self.comment_trailing.push(trailing)
+        else:
+            while not self.at_end() and not char_is_newline(self.peek()):
+                self.advance()
 
     pub def read_int(self) -> Token:
         # Hexadecimal: 0x / 0X
@@ -323,6 +382,19 @@ pub class Lexer:
         if not self.at_end(): self.advance()
         return Token.FStrLit(sb.to_string().as_str())
 
+    # Triple-quoted f-string `f"""..."""`: a multi-line f-string. Called after the
+    # `f` and the three opening quotes have been consumed. Content (with embedded
+    # newlines) is captured raw; the parser splits out the `{expr}` parts. Used
+    # heavily by macros to emit multi-line generated source.
+    pub def read_triple_fstring(self, quote: int) -> Token:
+        mut sb = StringBuilder.init(128)
+        while not self.at_end():
+            if self.peek() == quote and self.peek_at(1) == quote and self.peek_at(2) == quote:
+                self.advance(); self.advance(); self.advance()
+                return Token.FStrLit(sb.to_string().as_str())
+            sb.append_char(self.advance())
+        return Token.FStrLit(sb.to_string().as_str())
+
     pub def read_raw_string(self) -> Token:
         self.advance(); mut quote = self.advance()
         mut sb = StringBuilder.init(64)
@@ -365,12 +437,22 @@ pub class Lexer:
 
         mut tokens = Vec[Token].init(1024)
         mut at_line_start = True
+        mut trailing_dot = False  # previous line ended with '.', so this line continues the chain
         mut nesting = 0  # paren/bracket/brace depth; suppress Indent/Dedent inside
+        # Block-expressions (`do:`/`if:`/`match:`/`while:`) used INSIDE brackets,
+        # e.g. `2 * (do: ... )`, need indentation to matter again for their body.
+        # When such a block-opening colon is seen at end-of-line while nesting>0,
+        # we "suspend" bracket-suppression (save the depth, set nesting=0) and
+        # restore it once the body dedents back to the line that opened it.
+        mut susp_nesting = Vec[int].init(4)   # saved bracket depth per suspended block
+        mut susp_baseline = Vec[int].init(4)  # indent level at which each block closes
+        mut block_kw_seen = False             # a do/if/match/while header is open
 
         while not self.at_end():
             if self.pending_dedents > 0:
+                self.tok_col = 1
                 tokens.push(Token.Dedent)
-                self.token_lines.push(self.line)
+                self.push_loc()
                 self.pending_dedents = self.pending_dedents - 1
                 continue
 
@@ -397,7 +479,7 @@ pub class Lexer:
                 if char_is_newline(next_c) or next_c == 35:
                     if next_c == 35:
                         self.advance()
-                        self.skip_comment()
+                        self.skip_comment(false)   # standalone (own line)
                     else:
                         self.advance()
                         if next_c == 13 and self.peek() == 10: self.advance()
@@ -405,22 +487,60 @@ pub class Lexer:
                     at_line_start = True
                     continue
 
-                # 3. Handle Indent/Dedent tokens (suppressed inside brackets)
+                # 3. Handle Indent/Dedent tokens (suppressed inside brackets).
+                # Dot-continuation: if an indented line starts with '.' we treat it
+                # as a method-chain continuation of the previous expression - no
+                # INDENT/DEDENT is emitted, matching the behaviour inside parens.
+                # This enables builder patterns across multiple lines:
+                #   mut x = Foo.init()
+                #       .set("k", v)
+                #       .build()
                 if nesting == 0:
-                    mut cur_indent = self.indent_stack.get(self.indent_stack.len - 1)
-                    if indent > cur_indent:
-                        self.indent_stack.push(indent)
-                        tokens.push(Token.Indent)
-                        self.token_lines.push(self.line)
-                    elif indent < cur_indent:
-                        while self.indent_stack.len > 1:
-                            mut top = self.indent_stack.get(self.indent_stack.len - 1)
-                            if top <= indent: break
-                            self.indent_stack.len = self.indent_stack.len - 1
-                            tokens.push(Token.Dedent)
-                            self.token_lines.push(self.line)
+                    self.tok_col = self.pos - self.line_start + 1
+                    # No Indent/Dedent for a continuation line — either the next
+                    # line starts with '.' (leading-dot) or the previous line
+                    # ended with '.' (trailing-dot, tracked by `trailing_dot`).
+                    if next_c != 46 and not trailing_dot:
+                        mut cur_indent = self.indent_stack.get(self.indent_stack.len - 1)
+                        if indent > cur_indent:
+                            self.indent_stack.push(indent)
+                            tokens.push(Token.Indent)
+                            self.push_loc()
+                        elif indent < cur_indent:
+                            while self.indent_stack.len > 1:
+                                mut top = self.indent_stack.get(self.indent_stack.len - 1)
+                                if top <= indent: break
+                                self.indent_stack.len = self.indent_stack.len - 1
+                                tokens.push(Token.Dedent)
+                                self.push_loc()
+                            # After dedenting, the new level MUST equal this line's
+                            # indent — otherwise the line aligns with no enclosing
+                            # block (a misaligned block / inconsistent tabs+spaces).
+                            # Surface it as a located error the parser will report.
+                            mut newtop = self.indent_stack.get(self.indent_stack.len - 1)
+                            if newtop != indent:
+                                self.tok_col = self.pos - self.line_start + 1
+                                tokens.push(Token.Error("inconsistent indentation: this line does not line up with any enclosing block (check for mixed tabs and spaces, or an off-by-one indent)"))
+                                self.push_loc()
+                    trailing_dot = False  # consumed: this line is the continuation
+                    # Restore any bracket context whose block-expression has now
+                    # dedented back to (or past) the line that opened it. The body
+                    # DEDENTs were just emitted above, so the closing `)`/`]`/`}`
+                    # on this line is lexed with bracket-suppression active again.
+                    while susp_nesting.len > 0:
+                        mut _base = susp_baseline.get(susp_baseline.len - 1)
+                        if indent > _base: break
+                        nesting = susp_nesting.get(susp_nesting.len - 1)
+                        susp_nesting.len = susp_nesting.len - 1
+                        susp_baseline.len = susp_baseline.len - 1
+                        block_kw_seen = False
 
             mut c = self.peek()
+            # Capture the 1-based column of this token's first byte. All real
+            # tokens (numbers, strings, idents, operators) begin here; the
+            # Newline/comment branches below reuse it (column of the trailing
+            # newline char), which is fine for line-level diagnostics.
+            self.tok_col = self.pos - self.line_start + 1
             if char_is_space(c): 
                 self.advance()
                 continue
@@ -428,50 +548,79 @@ pub class Lexer:
                 self.advance()
                 if c == 13 and self.peek() == 10: self.advance()
                 if nesting == 0:
-                    tokens.push(Token.Newline)
-                    self.token_lines.push(self.line)
+                    # Suppress the Newline for a method-chain continuation: the
+                    # next line starts with '.' (leading-dot) OR this line ended
+                    # with '.' (trailing-dot — flag it so the next line's indent
+                    # is suppressed too).
+                    if _last_tok_is_dot(tokens):
+                        trailing_dot = True
+                    elif not _peek_next_line_dot(self.src, self.pos, self.len):
+                        tokens.push(Token.Newline)
+                        self.push_loc()
                     at_line_start = True
                 continue
             if c == 35:
                 self.advance()
-                self.skip_comment()
+                self.skip_comment(true)   # trailing (code preceded it on this line)
                 if nesting == 0:
-                    tokens.push(Token.Newline)
-                    self.token_lines.push(self.line)
+                    if _last_tok_is_dot(tokens):
+                        trailing_dot = True
+                    elif not _peek_next_line_dot(self.src, self.pos, self.len):
+                        tokens.push(Token.Newline)
+                        self.push_loc()
                     at_line_start = True
                 continue
 
             if char_is_digit(c):
                 tokens.push(self.read_int())
-                self.token_lines.push(self.line)
+                self.push_loc()
                 continue
             if c == 34 or c == 39:
                 if c == 34 and self.peek_at(1) == 34 and self.peek_at(2) == 34:
                     self.advance(); self.advance(); self.advance()
                     tokens.push(self.read_triple_string(34))
-                    self.token_lines.push(self.line)
+                    self.push_loc()
                 elif c == 39 and (self.peek_at(2) == 39 or self.peek_at(1) == 92):
                     tokens.push(self.read_char())
-                    self.token_lines.push(self.line)
+                    self.push_loc()
                 else:
                     tokens.push(self.read_string(c))
-                    self.token_lines.push(self.line)
+                    self.push_loc()
+                continue
+            if c == 102 and self.peek_at(1) == 34 and self.peek_at(2) == 34 and self.peek_at(3) == 34:
+                self.advance(); self.advance(); self.advance(); self.advance()  # consume f"""
+                tokens.push(self.read_triple_fstring(34))
+                self.push_loc()
                 continue
             if c == 102 and (self.peek_at(1) == 34 or self.peek_at(1) == 39):
                 tokens.push(self.read_fstring())
-                self.token_lines.push(self.line)
+                self.push_loc()
                 continue
             if c == 114 and (self.peek_at(1) == 34 or self.peek_at(1) == 39):
                 tokens.push(self.read_raw_string())
-                self.token_lines.push(self.line)
+                self.push_loc()
                 continue
             if c == 98 and (self.peek_at(1) == 34 or self.peek_at(1) == 39):
                 tokens.push(self.read_byte_string())
-                self.token_lines.push(self.line)
+                self.push_loc()
                 continue
             if char_is_alpha(c):
-                tokens.push(self.read_ident())
-                self.token_lines.push(self.line)
+                mut _idtok = self.read_ident()
+                # Remember when a block-expression keyword opens inside brackets, so
+                # its end-of-line colon can re-enable indentation for the body
+                # (`2 * (do: …)`, `(if c: …)`, `(match x: …)`). `do`/`match` are
+                # unambiguous; `if` also appears in the `a if c else b` ternary, but
+                # that has no end-of-line colon, so the flag only matters at a
+                # block-opening colon. block_kw_seen is cleared at every colon and
+                # at each suspend/restore, bounding any stale-flag window.
+                match _idtok:
+                    case Token.KwDo: block_kw_seen = True
+                    case Token.KwIf: block_kw_seen = True
+                    case Token.KwMatch: block_kw_seen = True
+                    case Token.KwLoop: block_kw_seen = True
+                    case _: pass
+                tokens.push(_idtok)
+                self.push_loc()
                 continue
 
             self.advance()
@@ -490,7 +639,8 @@ pub class Lexer:
                     self.advance()
                     tokens.push(Token.NotEq)
                 else:
-                    tokens.push(Token.Error("!"))
+                    # Bare `!` — used only for function-like macro calls `name!(…)`.
+                    tokens.push(Token.Bang)
             elif c == 60:
                 mut nc = self.peek()
                 if nc == 61:
@@ -601,7 +751,15 @@ pub class Lexer:
                 tokens.push(Token.RBrace)
                 if nesting > 0:
                     nesting = nesting - 1
-            elif c == 58: tokens.push(Token.Colon)
+            elif c == 58:
+                tokens.push(Token.Colon)
+                # A block-opening colon at end-of-line inside brackets suspends
+                # bracket-suppression so the block's body is indentation-delimited.
+                if nesting > 0 and block_kw_seen and self._at_eol_after_ws():
+                    susp_nesting.push(nesting)
+                    susp_baseline.push(self.indent_stack.get(self.indent_stack.len - 1))
+                    nesting = 0
+                block_kw_seen = False
             elif c == 44: tokens.push(Token.Comma)
             elif c == 59: tokens.push(Token.Semicolon)
             elif c == 64: tokens.push(Token.At)
@@ -628,13 +786,61 @@ pub class Lexer:
             else:
                 self.advance()
                 tokens.push(Token.Error("?"))
-            self.token_lines.push(self.line)
+            self.push_loc()
 
+        self.tok_col = 1
         while self.indent_stack.len > 1:
             self.indent_stack.len = self.indent_stack.len - 1
             tokens.push(Token.Dedent)
-            self.token_lines.push(self.line)
+            self.push_loc()
         tokens.push(Token.Eof)
-        self.token_lines.push(self.line)
+        self.push_loc()
         return tokens
+
+
+# -- Dot-continuation lookahead ------------------------------------------------
+# Returns true if the next non-blank, non-comment line (starting at `pos` in
+# `src`) begins with '.' (optionally preceded by horizontal whitespace).
+# Used by the tokenizer to suppress Newline/Indent/Dedent before chained calls.
+pub def _peek_next_line_dot(src: Pointer[char], pos: int, src_len: int) -> bool:
+    mut i = pos
+    while i < src_len:
+        mut c = src.offset(i).read() as int
+        if c == 32 or c == 9:        # horizontal whitespace
+            i = i + 1
+        elif c == 35:                 # '#' comment - skip to end of line
+            while i < src_len and src.offset(i).read() as int != 10:
+                i = i + 1
+        elif c == 10:                 # '\n'
+            i = i + 1
+        elif c == 13:                 # '\r'
+            i = i + 1
+            if i < src_len and src.offset(i).read() as int == 10:
+                i = i + 1
+        else:
+            return c == 46            # '.' -> chain continuation
+    return false
+
+# -- Trailing-dot continuation -------------------------------------------------
+# True when the most recently emitted real token is a '.' — i.e. the current
+# line ENDS with a dot, so the next line continues the method chain. Enables the
+# trailing-dot builder style (mirrors the leading-dot style above):
+#   mut x = Foo.init().
+#       set("k", v).
+#       build()
+# A float literal like `5.` lexes as a single Float token (not `5` then `.`),
+# so it never trips this.
+pub def _last_tok_is_dot(tokens: Vec[Token]) -> bool:
+    if tokens.len == 0: return false
+    match tokens.get(tokens.len - 1):
+        case Token.Dot:
+            # Only a chain continuation when the dot follows a chainable
+            # expression end. A dot right after a NUMBER (`5.`) is a malformed
+            # float, not a continuation — don't let it swallow the next line.
+            if tokens.len < 2: return false
+            match tokens.get(tokens.len - 2):
+                case Token.IntLit(_):   return false
+                case Token.FloatLit(_): return false
+                case _:                 return true
+        case _: return false
 

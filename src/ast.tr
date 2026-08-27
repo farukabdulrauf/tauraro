@@ -1,14 +1,30 @@
-# compiler/src/ast.tr — AST node types for the Tauraro self-hosted compiler.
+# @trusted: compiler systems module — audited raw-pointer core (like Rust std internals)
+# compiler/src/ast.tr - AST node types for the Tauraro self-hosted compiler.
 
 from core.vec import Vec
 from core.alloc import alloc, dealloc
 
-# ─── Type annotations ─────────────────────────────────────────────────────────
+# --- Type annotations ---------------------------------------------------------
 
+# @copy: AstType nodes are arena-allocated and immutable after construction.
+# They are freely aliased throughout the compiler (assigned to fields, reused after
+# assignment) and never individually freed, so sharing them is safe. The @copy
+# opt-in tells the move-checker to treat assignment as a shared copy, not a
+# destructive move - so the compiler's own code obeys the same rules it enforces.
+@copy
 pub class AstType:
     pub name: str
     pub args: Vec[Pointer[AstType]]
-    pub from_param: str  # 'from X' lifetime annotation — empty means none
+    pub from_param: str   # 'from X' region — first/single source (non-empty = borrow)
+    pub from_regions: Vec[str]   # all explicit region sources of `from a, b` (for [L-2])
+    pub from_index: int   # [cross-fn] for a single-region borrow RETURN type, the index
+                          # of the `from` parameter in the function's param list; -1 = none.
+                          # Lets a call site map the result's region to the matching arg.
+    pub is_borrow: bool   # true when written as `ref T` / `mut_ref T` — a borrow
+                          # (region) view. Erased to the inner type T for codegen;
+                          # the flag + from_param drive borrow checking (L-1/M-2).
+    pub is_mut_borrow: bool   # true specifically for `mut_ref T` (exclusive borrow)
+    pub array_size: int   # fixed-size array `[T; N]` -> N (element type in args[0]); 0 = not a fixed array
 
 extend AstType:
     pub def init(name: str) -> AstType:
@@ -16,6 +32,11 @@ extend AstType:
         t.name = name
         t.args = Vec[Pointer[AstType]].init(0)
         t.from_param = ""
+        t.from_regions = Vec[str].init(0)
+        t.from_index = -1
+        t.is_borrow = false
+        t.is_mut_borrow = false
+        t.array_size = 0
         return t
 
     pub def init_generic(name: str, arg: Pointer[AstType]) -> AstType:
@@ -24,6 +45,10 @@ extend AstType:
         t.args = Vec[Pointer[AstType]].init(1)
         t.args.push(arg)
         t.from_param = ""
+        t.from_regions = Vec[str].init(0)
+        t.from_index = -1
+        t.is_borrow = false
+        t.is_mut_borrow = false
         return t
 
 pub class GenericConstraint:
@@ -37,7 +62,7 @@ extend GenericConstraint:
         g.bounds = Vec[Pointer[AstType]].init(1)
         return g
 
-# ─── Decorators ───────────────────────────────────────────────────────────────
+# --- Decorators ---------------------------------------------------------------
 
 pub class Decorator:
     pub name: str
@@ -50,7 +75,7 @@ extend Decorator:
         d.args = Vec[Pointer[Expr]].init(0)
         return d
 
-# ─── Patterns ─────────────────────────────────────────────────────────────────
+# --- Patterns -----------------------------------------------------------------
 
 pub enum Pattern:
     PWild
@@ -95,7 +120,7 @@ extend CatchClause:
         c.err_type = Pointer[AstType](0)
         c.body = body
         return c
-# ─── Match arms ───────────────────────────────────────────────────────────────
+# --- Match arms ---------------------------------------------------------------
 
 pub class MatchArm:
     pub pat: Pattern
@@ -110,29 +135,40 @@ extend MatchArm:
         a.body = body
         return a
 
-# ─── F-string parts ───────────────────────────────────────────────────────────
+# --- F-string parts -----------------------------------------------------------
 
 pub class FStringPart:
-    pub is_expr: bool
-    pub text: str               
-    pub expr: Pointer[Expr]     
+    pub is_expr:  bool
+    pub text:     str
+    pub expr:     Pointer[Expr]
+    pub fmt_spec: str    # e.g. ".2f", ">10", "05d" - empty means default
 
 extend FStringPart:
     pub def init_text(s: str) -> FStringPart:
         mut p = FStringPart()
-        p.is_expr = false
-        p.text = s
-        p.expr = Pointer[Expr](0)
+        p.is_expr  = false
+        p.text     = s
+        p.expr     = Pointer[Expr](0)
+        p.fmt_spec = ""
         return p
 
     pub def init_expr(e: Pointer[Expr]) -> FStringPart:
         mut p = FStringPart()
-        p.is_expr = true
-        p.text = ""
-        p.expr = e
+        p.is_expr  = true
+        p.text     = ""
+        p.expr     = e
+        p.fmt_spec = ""
         return p
 
-# ─── Expressions ──────────────────────────────────────────────────────────────
+    pub def init_expr_fmt(e: Pointer[Expr], spec: str) -> FStringPart:
+        mut p = FStringPart()
+        p.is_expr  = true
+        p.text     = ""
+        p.expr     = e
+        p.fmt_spec = spec
+        return p
+
+# --- Expressions --------------------------------------------------------------
 
 pub enum Expr:
     ELitInt(val: int)
@@ -169,8 +205,28 @@ pub enum Expr:
     ERange(start: Pointer[Expr], end: Pointer[Expr], inclusive: bool)
     ESizeOf(ty: Pointer[AstType])
     EIfElse(cond: Pointer[Expr], then_expr: Pointer[Expr], else_expr: Pointer[Expr])
+    ETypeArg(ty: Pointer[AstType])
+    # `do:` block-expression — runs its body and evaluates to the last bare
+    # expression (lowers to a GCC statement-expression, zero-cost).
+    EDo(body: Block)
+    # `match … :` block-expression — each arm's last bare expression is the
+    # value; lowers to a statement-expression dispatching into per-arm `do:`s.
+    EMatch(subj: Pointer[Expr], arms: Vec[MatchArm])
+    # Function-like macro call `name!(args)` — expanded at compile time (between
+    # parse and sema) into the macro's returned source, parsed as an expression
+    # and substituted here. Args are kept as parsed expressions; the macro sees
+    # their rendered source text. (The `@name` decorator form is additive; this
+    # `name!` form is inline/expression-position "full power".)
+    EMacroCall(name: str, args: Vec[Pointer[Expr]])
+    # `loop:` block-expression — an infinite loop whose value comes from
+    # `break <value>`. Lowers to `({ T _lres; for(;;){…} _lres; })`.
+    ELoop(body: Block)
+    # `while c:` block-expression — value comes from `break <value>`; on normal
+    # exit (condition false) the optional `else:` block's last expression is the
+    # value (empty/zero if there is no else).
+    EWhileExpr(cond: Pointer[Expr], body: Block, else_body: Block)
 
-# ─── Chan-select arms ─────────────────────────────────────────────────────────
+# --- Chan-select arms ---------------------------------------------------------
 
 pub class ChanSelectArm:
     pub kind: int                   # 0=recv, 1=send, 2=timeout, 3=default
@@ -202,7 +258,7 @@ extend ChanSelectArm:
         a.var_name = ""; a.timeout_ms = Pointer[Expr](0); a.body = body
         return a
 
-# ─── Statements ───────────────────────────────────────────────────────────────
+# --- Statements ---------------------------------------------------------------
 
 pub enum Stmt:
     SExpr(expr: Pointer[Expr])
@@ -210,14 +266,16 @@ pub enum Stmt:
     SMultiLet(names: Vec[str], is_mut: bool, val: Pointer[Expr])
     SAssign(target: Pointer[Expr], val: Pointer[Expr])
     SReturn(val: Pointer[Expr])
-    SBreak
+    # `break` optionally carries a value when it exits a `loop:`/`while:` used as
+    # an expression (`break v`); val is a null Pointer for a plain `break`.
+    SBreak(val: Pointer[Expr])
     SContinue
     SPass
     SRaise(val: Pointer[Expr])
     SUnsafe(body: Block)
     SIf(cond: Pointer[Expr], then_b: Block, elifs: Vec[ElifClause], else_b: Block)
     SWhile(cond: Pointer[Expr], body: Block, decorators: Vec[Decorator])
-    SFor(var: str, iter: Pointer[Expr], body: Block, decorators: Vec[Decorator])
+    SFor(var: str, iter: Pointer[Expr], body: Block, decorators: Vec[Decorator], is_ref: bool)
     SForUnpack(vars: Vec[str], iter: Pointer[Expr], body: Block)
     SMatch(expr: Pointer[Expr], arms: Vec[MatchArm])
     STry(try_body: Block, catches: Vec[Pointer[CatchClause]], finally_b: Block)
@@ -228,7 +286,9 @@ pub enum Stmt:
     STaskGroup(body: Block)
     SGpuBlock(body: Block)
     SChanSelect(cases: Vec[Pointer[ChanSelectArm]])
+    SDefer(stmt: Pointer[Stmt])   # defer stmt - run at function exit, LIFO order
     SLine(n: int)
+    SLocalDecl(decl: Pointer[Decl])   # nested class/def/enum/interface/extend - main() only
 
 pub class Block:
     pub stmts: Vec[Pointer[Stmt]]
@@ -259,13 +319,14 @@ extend ElifClause:
         c.body = body
         return c
 
-# ─── Function parameters ──────────────────────────────────────────────────────
+# --- Function parameters ------------------------------------------------------
 
 pub class Param:
     pub name: str
     pub ty: Pointer[AstType]
-    pub is_ref: bool      # 'ref T' parameter — immutable borrow, not a copy
-    pub is_mut_ref: bool  # 'mut ref T' parameter — mutable borrow
+    pub is_ref: bool      # 'ref T' parameter - immutable borrow, not a copy
+    pub is_mut_ref: bool  # 'mut ref T' parameter - mutable borrow
+    pub is_variadic: bool # 'name...' or 'name: T...' - collects trailing call args into List[T]
 
 extend Param:
     pub def init(name: str, ty: Pointer[AstType]) -> Param:
@@ -274,9 +335,10 @@ extend Param:
         p.ty = ty
         p.is_ref = false
         p.is_mut_ref = false
+        p.is_variadic = false
         return p
 
-# ─── Top-level declarations ───────────────────────────────────────────────────
+# --- Top-level declarations ---------------------------------------------------
 
 pub class FunctionDef:
     pub name: str
@@ -290,8 +352,14 @@ pub class FunctionDef:
     pub is_async: bool
     pub is_extern: bool
     pub is_public: bool
+    pub is_export: bool   # `export def` - emit a C-ABI dllexport/visibility wrapper for FFI
+    pub is_macro: bool    # `macro def` - compile-time code-generating macro (expanded before sema)
+    pub is_lib: bool      # from the trusted standard library (std/core) - exempt from the strict raw-pointer checks ([P-2]), like Rust's std audited-`unsafe` core
     pub body: Block
     pub line: int
+    # `where a outlives b` region bounds (Gap 4) — parallel: outlives_a[i] outlives outlives_b[i].
+    pub outlives_a: Vec[str]
+    pub outlives_b: Vec[str]
 
 extend FunctionDef:
     pub def init(name: str) -> FunctionDef:
@@ -307,8 +375,13 @@ extend FunctionDef:
         f.is_async = false
         f.is_extern = false
         f.is_public = false
+        f.is_export = false
+        f.is_macro = false
+        f.is_lib = false
         f.body = Block.init()
         f.line = 0
+        f.outlives_a = Vec[str].init(0)
+        f.outlives_b = Vec[str].init(0)
         return f
 
 pub class FieldDef:
@@ -336,6 +409,8 @@ pub class ClassDef:
     pub is_public: bool
     pub is_class: bool
     pub line: int
+    pub docstring: str
+    pub region_params: Vec[str]   # 'from r' region (lifetime) parameters
 
 extend ClassDef:
     pub def init(name: str) -> ClassDef:
@@ -351,6 +426,8 @@ extend ClassDef:
         c.is_public = false
         c.is_class = true
         c.line = 0
+        c.docstring = ""
+        c.region_params = Vec[str].init(0)
         return c
 
 pub class VariantDef:
@@ -373,6 +450,8 @@ pub class EnumDef:
     pub decorators: Vec[Decorator]
     pub is_public: bool
     pub line: int
+    pub region_params: Vec[str]   # 'from r' region (lifetime) parameters — variant
+                                  # payloads written `ref T from r` borrow for region r.
 
 extend EnumDef:
     pub def init(name: str) -> EnumDef:
@@ -385,6 +464,7 @@ extend EnumDef:
         e.decorators = Vec[Decorator].init(0)
         e.is_public = false
         e.line = 0
+        e.region_params = Vec[str].init(0)
         return e
 
 pub class InterfaceDef:
@@ -393,6 +473,9 @@ pub class InterfaceDef:
     pub methods: Vec[FunctionDef]
     pub is_public: bool
     pub line: int
+    pub decorators: Vec[Decorator]
+    pub region_params: Vec[str]   # 'from r' region (lifetime) parameters — method
+                                  # signatures may return `ref T from r`.
 
 extend InterfaceDef:
     pub def init(name: str) -> InterfaceDef:
@@ -402,6 +485,8 @@ extend InterfaceDef:
         i.methods = Vec[FunctionDef].init(4)
         i.is_public = false
         i.line = 0
+        i.decorators = Vec[Decorator].init(0)
+        i.region_params = Vec[str].init(0)
         return i
 
 pub class ImportItem:
@@ -421,12 +506,13 @@ pub enum Decl:
     DEnum(enm: EnumDef)
     DInterface(iface: InterfaceDef)
     DExtend(target: str, methods: Vec[FunctionDef])
-    DImport(path: str, alias: str)             
+    DImport(path: str, alias: str)
     DFromImport(path: str, items: Vec[ImportItem])
     DExtern(abi: str, functions: Vec[FunctionDef])
     DTopLevelStmt(stmt: Pointer[Stmt])
     DActor(cls: ClassDef)
     DDecoratorDef(func: FunctionDef)
+    DTypeAlias(name: str, target: Pointer[AstType])   # type Name = ExistingType
 
 pub class Program:
     pub decls: Vec[Pointer[Decl]]

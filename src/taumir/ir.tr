@@ -1,0 +1,646 @@
+# @trusted: compiler systems module — audited raw-pointer core.
+# src/taumir/ir.tr — the lowered IR ("LIR"): vregs + explicit ops over a control-flow
+# graph of basic blocks. What the native (x86-64/ELF) and LLVM backends consume.
+# Distinct from src/mir.tr (a CFG-over-HIR for ownership analysis; its stmts hold HirExpr).
+#
+# Codegen uses a trivial "every vreg + var in a stack slot" model (no register allocation
+# yet) — fast COMPILE, -O0 runtime (that's the point; C/LLVM cover release perf).
+
+from core.alloc import alloc
+from hir import HirStmt, HirProgram
+from ast import AstType
+
+pub enum LType:
+    LVoid
+    LI64
+    LPtr
+
+# An LIR instruction. Results/operands are vreg ids (ints); dst = -1 means void.
+# IBinOp `op` covers arithmetic ("+","-","*") and comparisons ("<",">","==","!=","<=",">=")
+# — a comparison produces 0/1 in its dst vreg.
+pub enum LInst:
+    IConst(dst: int, v: int)
+    IStr(dst: int, str_idx: int)              # dst = &module.strings[str_idx] (.rodata C-string)
+    IBinOp(dst: int, op: str, a: int, b: int)
+    ILoadVar(dst: int, name: str)
+    IStoreVar(name: str, src: int)
+    ILoadGlobal(dst: int, gidx: int)          # dst = module global slot #gidx (.bss)
+    IStoreGlobal(gidx: int, src: int)         # global slot #gidx = src
+    ICall(dst: int, callee: str, args: Vec[int])
+    IFBinOp(dst: int, op: str, a: int, b: int)  # f64 arith (+,-,*,/) or compare (-> 0/1 bool)
+    IIToF(dst: int, src: int)                   # int -> f64  (cvtsi2sd)
+    IFToI(dst: int, src: int)                   # f64 -> int  (cvttsd2si, truncates)
+    IFCall1(dst: int, callee: str, arg: int)    # call callee(f64 arg in xmm0); rax -> dst if >=0
+    IFCallF(dst: int, callee: str, arg: int)    # call callee(f64 xmm0) -> f64 xmm0 -> dst
+    IFCall2F(dst: int, callee: str, a: int, b: int)  # call callee(f64 xmm0, f64 xmm1) -> f64 -> dst
+    IBitsF(dst: int, src: int)                  # reinterpret i64 bit pattern -> f64 (no conversion)
+    IFBits(dst: int, src: int)                  # reinterpret f64 -> i64 bit pattern (no conversion)
+    IAddrVar(dst: int, name: str)               # dst = address of var's stack slot (closure captures)
+    IAddrGlobal(dst: int, gidx: int)            # dst = address of module global slot #gidx (fixed-array base)
+    IFuncAddr(dst: int, fname: str)             # dst = address of a defined function
+    ICallInd(dst: int, fnreg: int, args: Vec[int])  # indirect call through the pointer in fnreg
+    IAsm(code: str, cons: str)                       # inline asm: LLVM `call void asm sideeffect`
+    ILoad(dst: int, base: int, off: int, aclass: int)   # dst = *(int64_t*)(base + off)  (inline mem load)
+    IStore(base: int, off: int, src: int, aclass: int)  # *(int64_t*)(base + off) = src  (inline mem store)
+                                                     # aclass = TBAA alias class (LLVM only; native ignores):
+                                                     # 0 generic, 1 list header, 2 list element, 3 obj field
+    ILoadB(dst: int, base: int, off: int)            # dst = zext(*(uint8_t*)(base + off))  — 1-byte elem load
+    IStoreB(base: int, off: int, src: int)           # *(uint8_t*)(base + off) = trunc(src) — 1-byte elem store
+
+# Block terminator (exactly one per block).
+pub enum LTerm:
+    TRetInt(v: int)                         # return an integer constant
+    TRetVal(v: int)                         # return the value in vreg v
+    TRetVoid
+    TBr(target: int)                        # -> block{target}
+    TCondBr(cond: int, then_b: int, else_b: int)   # cond!=0 ? then : else
+    TUnset
+
+pub def box_linst(i: LInst) -> Pointer[LInst]:
+    unsafe:
+        mut p = alloc[LInst](1)
+        p.write(i)
+        return p
+
+pub class LBlock:
+    pub id:    int
+    pub insts: Vec[Pointer[LInst]]
+    pub term:  LTerm
+
+extend LBlock:
+    pub def init(id: int) -> LBlock:
+        mut b = LBlock()
+        b.id    = id
+        b.insts = Vec[Pointer[LInst]].init(8)
+        b.term  = LTerm.TUnset
+        return b
+
+pub class LFunc:
+    pub name:       str
+    pub is_main:    bool
+    pub blocks:     Vec[LBlock]      # basic blocks in layout order (block 0 = entry)
+    pub cur:        int             # block currently being built
+    pub n_vregs:    int
+    pub vreg_types: Vec[int]        # per-vreg value type: 0 = int (i64), 1 = ptr (char*)
+    pub vars:       Vec[str]
+    pub var_types:  Vec[int]        # parallel to vars: 0 = int, 1 = ptr
+    pub var_cls:    Vec[str]        # parallel to vars: class name if the var holds an object, else ""
+    pub var_arr:    Vec[int]        # parallel to vars: fixed-array length N (`[T;N]`), else 0 (scalar)
+    pub params:     Vec[str]        # parameter names in order (System V arg registers -> slots)
+    pub tmp_ctr:    int             # monotonic counter for synthesized (loop) var names
+    pub loop_cont:  Vec[int]        # stack of `continue` target block ids (innermost = last)
+    pub loop_brk:   Vec[int]        # stack of `break` target block ids (innermost = last)
+    pub fresh_strs: Vec[int]        # ARC: vregs holding a fresh owned str not yet consumed
+    pub fresh_objs: Vec[int]        # ARC: vregs holding a fresh owned object (ctor result) not yet consumed
+    pub captures:   Vec[str]        # OUTLINED CLOSURE body: captured var names (by-ref via env)
+    pub cap_tags:   Vec[int]        # parallel: value-type tag of each capture
+    pub var_xret:   Vec[int]        # parallel to vars: closure return tag (-1 = not a closure)
+    pub vreg_xret:  Vec[int]        # parallel to vregs: closure return tag (-1 = not a closure)
+    pub try_blks:   Vec[int]        # innermost-last: except-entry block ids (lexical try/except)
+    pub try_msgs:   Vec[str]        # parallel: synthetic var holding the raised message
+    pub defers:     Vec[Pointer[HirStmt]]  # `defer` stmts (LIFO at every function exit)
+    pub mutex_unlocks: Vec[str]            # Mutex vars locked via .lock()/.get() -> auto-unlock at exit (RAII)
+    pub blk_depth:  int             # lower_block nesting (1 = the function's own body)
+    pub in_defer:   bool            # lowering a deferred stmt (rejects nested defer/return)
+    pub is_throws:  bool            # `throws E` fn: return -> Result.Ok(v), raise(e) -> Result.Err(e)
+    pub throws_ok_tag:  int         # value-type tag of the Ok payload (declared return type)
+    pub throws_err_tag: int         # value-type tag of the Err payload (throws error type)
+    pub in_taskgroup:   int         # >0 while lowering a task_group body: spawns join at group end
+
+extend LFunc:
+    pub def init(name: str) -> LFunc:
+        mut f = LFunc()
+        f.name       = name
+        f.is_main    = false
+        f.blocks     = Vec[LBlock].init(4)
+        f.cur        = -1
+        f.n_vregs    = 0
+        f.vreg_types = Vec[int].init(8)
+        f.vars       = Vec[str].init(4)
+        f.var_types  = Vec[int].init(4)
+        f.var_cls    = Vec[str].init(4)
+        f.var_arr    = Vec[int].init(4)
+        f.params     = Vec[str].init(4)
+        f.tmp_ctr    = 0
+        f.loop_cont  = Vec[int].init(4)
+        f.loop_brk   = Vec[int].init(4)
+        f.fresh_strs = Vec[int].init(8)
+        f.fresh_objs = Vec[int].init(8)
+        f.captures   = Vec[str].init(2)
+        f.cap_tags   = Vec[int].init(2)
+        f.var_xret   = Vec[int].init(4)
+        f.vreg_xret  = Vec[int].init(8)
+        f.try_blks   = Vec[int].init(2)
+        f.try_msgs   = Vec[str].init(2)
+        f.defers     = Vec[Pointer[HirStmt]].init(2)
+        f.mutex_unlocks = Vec[str].init(2)
+        f.blk_depth  = 0
+        f.in_defer   = false
+        f.is_throws  = false
+        f.throws_ok_tag  = 0
+        f.throws_err_tag = 0
+        f.in_taskgroup   = 0
+        return f
+
+    # A monotonically increasing id, for building unique synthesized variable names
+    # (e.g. hidden for-loop index/handle slots that must not collide across loops).
+    pub def fresh_id(self) -> int:
+        mut id = self.tmp_ctr
+        self.tmp_ctr = self.tmp_ctr + 1
+        return id
+
+    # Create a new empty block, return its id (does NOT change the cursor).
+    pub def new_block(self) -> int:
+        mut id = self.blocks.len
+        self.blocks.push(LBlock.init(id))
+        return id
+
+    pub def set_cur(self, id: int):
+        self.cur = id
+
+    pub def emit(self, i: LInst):
+        self.blocks.get(self.cur).insts.push(box_linst(i))
+
+    # Set the current block's terminator, but only if it hasn't been set (the first
+    # terminator wins — e.g. a `return` inside an if-body isn't overwritten by the
+    # branch-to-end that the if-lowering would otherwise append).
+    pub def set_term(self, t: LTerm):
+        mut b = self.blocks.get(self.cur)
+        match b.term:
+            case LTerm.TUnset: b.term = t
+            case _: pass
+
+    pub def cur_terminated(self) -> bool:
+        match self.blocks.get(self.cur).term:
+            case LTerm.TUnset: return false
+            case _: return true
+
+    pub def new_vreg(self) -> int:
+        mut id = self.n_vregs
+        self.n_vregs = self.n_vregs + 1
+        self.vreg_types.push(0)
+        self.vreg_xret.push(-1)
+        return id
+
+    pub def set_vreg_type(self, id: int, t: int):
+        if id >= 0 and id < self.vreg_types.len: self.vreg_types.set(id, t)
+
+    pub def vreg_type(self, id: int) -> int:
+        if id >= 0 and id < self.vreg_types.len: return self.vreg_types.get(id)
+        return 0
+
+    pub def add_var(self, name: str):
+        mut i = 0
+        while i < self.vars.len:
+            if self.vars.get(i) == name: return
+            i = i + 1
+        self.vars.push(name)
+        self.var_types.push(0)
+        self.var_cls.push("")
+        self.var_arr.push(0)
+        self.var_xret.push(-1)
+
+    pub def var_index(self, name: str) -> int:
+        mut i = 0
+        while i < self.vars.len:
+            if self.vars.get(i) == name: return i
+            i = i + 1
+        return -1
+
+    pub def set_var_type(self, name: str, t: int):
+        mut idx = self.var_index(name)
+        if idx >= 0: self.var_types.set(idx, t)
+
+    pub def var_type(self, name: str) -> int:
+        mut idx = self.var_index(name)
+        if idx >= 0: return self.var_types.get(idx)
+        return 0
+
+    pub def set_var_cls(self, name: str, cls: str):
+        mut idx = self.var_index(name)
+        if idx >= 0: self.var_cls.set(idx, cls)
+
+    pub def var_cls_of(self, name: str) -> str:
+        mut idx = self.var_index(name)
+        if idx >= 0: return self.var_cls.get(idx)
+        return ""
+
+    # Fixed-array length of a var (`[T;N]` -> N); 0 for scalars. The element type tag is
+    # kept in var_types; the alloca becomes `[N x <elem>]` and index access uses IAddrVar +
+    # byte-offset (getelementptr) directly against the var's own storage (no heap handle).
+    pub def set_var_arr(self, name: str, n: int):
+        mut idx = self.var_index(name)
+        if idx >= 0: self.var_arr.set(idx, n)
+
+    pub def var_arr_of(self, name: str) -> int:
+        mut idx = self.var_index(name)
+        if idx >= 0: return self.var_arr.get(idx)
+        return 0
+
+    # Closure return-tag plumbing: a vreg holding a freshly-built closure records the
+    # closure's return tag; storing it into a var carries the tag to call sites.
+    pub def set_vreg_xret(self, id: int, t: int):
+        if id >= 0 and id < self.vreg_xret.len: self.vreg_xret.set(id, t)
+
+    pub def vreg_xret_of(self, id: int) -> int:
+        if id >= 0 and id < self.vreg_xret.len: return self.vreg_xret.get(id)
+        return -1
+
+    pub def set_var_xret(self, name: str, t: int):
+        mut idx = self.var_index(name)
+        if idx >= 0: self.var_xret.set(idx, t)
+
+    pub def var_xret_of(self, name: str) -> int:
+        mut idx = self.var_index(name)
+        if idx >= 0: return self.var_xret.get(idx)
+        return -1
+
+    pub def capture_index(self, name: str) -> int:
+        mut i = 0
+        while i < self.captures.len:
+            if self.captures.get(i) == name: return i
+            i = i + 1
+        return -1
+
+# A class's memory layout for the LIR backends: every field is an 8-byte slot, so the
+# offset of field #i is i*8 and the instance size is n_fields*8. Independent of the C
+# backend's packed struct layout (each program uses ONE backend; they never share memory).
+pub class ClassLayout:
+    pub name:   str
+    pub base:   str             # parent class name ("" = no base); parent fields lay FIRST
+    pub fields: Vec[str]        # field names in declaration order (incl. inherited, first)
+    pub ftags:  Vec[int]        # parallel: value-type tag of each field
+    pub fcls:   Vec[str]        # parallel: class/enum name for object fields ("" if scalar)
+    pub is_value: bool          # @value_type: stored INLINE by value (no heap handle, copy on assign)
+
+extend ClassLayout:
+    pub def init(name: str) -> ClassLayout:
+        mut c = ClassLayout()
+        c.name   = name
+        c.base   = ""
+        c.fields = Vec[str].init(4)
+        c.ftags  = Vec[int].init(4)
+        c.fcls   = Vec[str].init(4)
+        c.is_value = false
+        return c
+
+    pub def field_index(self, fname: str) -> int:
+        mut i = 0
+        while i < self.fields.len:
+            if self.fields.get(i) == fname: return i
+            i = i + 1
+        return -1
+
+# One enum variant's payload layout. Payload field #i lives at byte offset 8*(1+i) —
+# offset 0 always holds the variant tag. Variants of one enum overlay (union-style).
+pub class VariantLayout:
+    pub name:   str
+    pub fields: Vec[str]        # declared payload field names, in order
+    pub ftags:  Vec[int]        # parallel: value-type tag of each payload field
+    pub fcls:   Vec[str]        # parallel: class/enum name for object payloads ("" if scalar)
+
+extend VariantLayout:
+    pub def init(name: str) -> VariantLayout:
+        mut v = VariantLayout()
+        v.name   = name
+        v.fields = Vec[str].init(2)
+        v.ftags  = Vec[int].init(2)
+        v.fcls   = Vec[str].init(2)
+        return v
+
+# An enum = a heap object: { tag: i64 @0, payload slots @8.. } (size = 8*(1+max payload)).
+pub class EnumLayout:
+    pub name:     str
+    pub variants: Vec[VariantLayout]
+
+extend EnumLayout:
+    pub def init(name: str) -> EnumLayout:
+        mut e = EnumLayout()
+        e.name     = name
+        e.variants = Vec[VariantLayout].init(4)
+        return e
+
+    pub def variant_index(self, vname: str) -> int:
+        mut i = 0
+        while i < self.variants.len:
+            if self.variants.get(i).name == vname: return i
+            i = i + 1
+        return -1
+
+pub class LModule:
+    pub funcs:    Vec[LFunc]
+    pub classes:  Vec[ClassLayout]     # registered class layouts (object model)
+    pub enums:    Vec[EnumLayout]      # registered enum layouts (tagged unions)
+    pub ifaces:   Vec[str]             # interface names: iface-typed params specialize
+                                       # per concrete arg class (zero-cost static dispatch)
+    pub externs:  Vec[str]
+    pub fn_names: Vec[str]      # user function names (defined in this module; call targets)
+    pub fn_ret:   Vec[int]      # parallel to fn_names: return value-type tag (0/1/2/3/4)
+    pub strings:  Vec[str]      # string literals -> .rodata (each NUL-terminated)
+    pub globals:      Vec[str]              # module-level variable names (-> .bss slots)
+    pub global_types: Vec[int]              # parallel to globals: value-type tag
+    pub global_arr:   Vec[int]              # parallel to globals: fixed-array length N (`[T;N]`), else 0
+    pub global_inits: Vec[Pointer[HirStmt]] # top-level init statements, run at start of main
+    pub hir_prog: HirProgram                # the program being lowered (generic fns are
+                                            # instantiated lazily from here at call sites)
+    pub ok:       bool
+    pub fail_note: str                      # when ok=false: which fn/construct failed (diagnostics)
+    pub unavail_names: Vec[str]             # fns whose BODY couldn't lower (lazy reachability:
+    pub unavail_notes: Vec[str]             # only fatal if a LOWERED fn actually calls one)
+    pub subst_names: Vec[str]               # active generic-class substitution (T -> concrete),
+    pub subst_tys:   Vec[Pointer[AstType]]  # consulted by _tag_of while lowering an instantiation
+    pub extfn_names: Vec[str]               # extern "C" fn names (call targets, linker-resolved)
+    pub extfn_ret:   Vec[int]               # parallel: return value-type tag
+    pub fn_owned_names: Vec[str]            # ARC: mangled fns whose object return is OWNED (fresh)
+                                            # by the caller (sema returns_owned). Fail-safe SET:
+                                            # a missing entry -> treated as a borrow -> leak, never UAF.
+    pub overloaded_sigs: Vec[str]           # "Cls_method" keys where >1 same-name method exists;
+                                            # such methods mangle to Cls_method_<Nargs>arg (matches C).
+    pub target_llvm: bool                   # true when lowering for the LLVM backend (which passes
+                                            # call args on the stack past 6, unlike the native reg ABI).
+    pub no_heap: bool                       # --no-heap: reject heap-allocating LIR constructs (enum
+                                            # ctors box via _tr_rt_obj_alloc) so the zero-heap guarantee
+                                            # holds on the LLVM/native backends (C keeps them on the stack).
+
+extend LModule:
+    pub def init() -> LModule:
+        mut m = LModule()
+        m.funcs    = Vec[LFunc].init(4)
+        m.classes  = Vec[ClassLayout].init(4)
+        m.enums    = Vec[EnumLayout].init(4)
+        m.ifaces   = Vec[str].init(4)
+        m.externs  = Vec[str].init(4)
+        m.fn_names = Vec[str].init(8)
+        m.fn_ret   = Vec[int].init(8)
+        m.strings  = Vec[str].init(4)
+        m.globals      = Vec[str].init(4)
+        m.global_types = Vec[int].init(4)
+        m.global_arr   = Vec[int].init(4)
+        m.global_inits = Vec[Pointer[HirStmt]].init(4)
+        m.ok       = true
+        m.fail_note = ""
+        m.unavail_names = Vec[str].init(4)
+        m.unavail_notes = Vec[str].init(4)
+        m.subst_names = Vec[str].init(2)
+        m.subst_tys   = Vec[Pointer[AstType]].init(2)
+        m.extfn_names = Vec[str].init(4)
+        m.extfn_ret   = Vec[int].init(4)
+        m.fn_owned_names = Vec[str].init(8)
+        m.overloaded_sigs = Vec[str].init(4)
+        m.target_llvm = false
+        m.no_heap = false
+        return m
+
+    # Method-overload registry (mirrors the C backend's overloaded_sigs). A method name
+    # is "overloaded" when its class declares >1 method with that name; such methods are
+    # emitted + dispatched as `Cls_method_<Nargs>arg` (self excluded from the count).
+    pub def mark_overloaded(self, cls: str, method: str):
+        mut key = cls + "_" + method
+        if self.is_overloaded(cls, method): return
+        self.overloaded_sigs.push(key)
+
+    pub def is_overloaded(self, cls: str, method: str) -> bool:
+        mut key = cls + "_" + method
+        mut i = 0
+        while i < self.overloaded_sigs.len:
+            if self.overloaded_sigs.get(i) == key: return true
+            i = i + 1
+        return false
+
+    # resolve_method, but overload-aware: when the defining class marks `method` as
+    # overloaded, prefer the `_<argc>arg`-mangled name; else fall back to the bare name.
+    pub def resolve_method_ov(self, cls: str, method: str, argc: int) -> str:
+        mut cur = cls
+        mut depth = 0
+        while depth < 32:                       # cycle guard
+            mut ci = self.class_index(cur)
+            if ci < 0: return ""
+            if self.is_overloaded(cur, method):
+                mut mm = cur + "_" + method + "_" + argc.to_str() + "arg"
+                if self.is_user_fn(mm): return mm
+            mut mangled = cur + "_" + method
+            if self.is_user_fn(mangled): return mangled
+            cur = self.classes.get(ci).base
+            if (cur as Pointer[char]) as usize == 0 as usize or cur == "": return ""
+            depth = depth + 1
+        return ""
+
+    # Register a module-level global; returns its slot index (dedup by name).
+    pub def add_global(self, name: str, tag: int) -> int:
+        mut i = 0
+        while i < self.globals.len:
+            if self.globals.get(i) == name: return i
+            i = i + 1
+        self.globals.push(name)
+        self.global_types.push(tag)
+        self.global_arr.push(0)
+        return self.globals.len - 1
+
+    # Mark global #idx as a fixed-size array of N slots (element tag in global_types); the
+    # emitted decl becomes `@g.idx = internal global [N x i64] zeroinitializer`.
+    pub def set_global_arr(self, idx: int, n: int):
+        if idx >= 0 and idx < self.global_arr.len: self.global_arr.set(idx, n)
+
+    pub def global_arr_of(self, name: str) -> int:
+        mut idx = self.global_index(name)
+        if idx >= 0: return self.global_arr.get(idx)
+        return 0
+
+    pub def global_index(self, name: str) -> int:
+        mut i = 0
+        while i < self.globals.len:
+            if self.globals.get(i) == name: return i
+            i = i + 1
+        return -1
+
+    pub def is_global(self, name: str) -> bool:
+        return self.global_index(name) >= 0
+
+    pub def global_type(self, name: str) -> int:
+        mut idx = self.global_index(name)
+        if idx >= 0: return self.global_types.get(idx)
+        return 0
+
+    # Return value-type tag of a user function (parallel to fn_names); 0 if unknown.
+    pub def fn_ret_tag(self, name: str) -> int:
+        mut i = 0
+        while i < self.fn_names.len:
+            if self.fn_names.get(i) == name: return self.fn_ret.get(i)
+            i = i + 1
+        return 0
+
+    # Intern a string literal, returning its index in the .rodata table.
+    pub def add_string(self, s: str) -> int:
+        mut i = 0
+        while i < self.strings.len:
+            if self.strings.get(i) == s: return i
+            i = i + 1
+        self.strings.push(s)
+        return self.strings.len - 1
+
+    pub def add_extern(self, name: str):
+        mut i = 0
+        while i < self.externs.len:
+            if self.externs.get(i) == name: return
+            i = i + 1
+        self.externs.push(name)
+
+    pub def is_user_fn(self, name: str) -> bool:
+        mut i = 0
+        while i < self.fn_names.len:
+            if self.fn_names.get(i) == name: return true
+            i = i + 1
+        return false
+
+    pub def is_extern_fn(self, name: str) -> bool:
+        mut i = 0
+        while i < self.extfn_names.len:
+            if self.extfn_names.get(i) == name: return true
+            i = i + 1
+        return false
+
+    pub def extern_ret_tag(self, name: str) -> int:
+        mut i = 0
+        while i < self.extfn_names.len:
+            if self.extfn_names.get(i) == name: return self.extfn_ret.get(i)
+            i = i + 1
+        return 0
+
+    # ARC: record that `name` returns an OWNED (fresh) object to its caller. Dedup.
+    pub def mark_fn_owned(self, name: str):
+        mut i = 0
+        while i < self.fn_owned_names.len:
+            if self.fn_owned_names.get(i) == name: return
+            i = i + 1
+        self.fn_owned_names.push(name)
+
+    # ARC: does `name`'s object return transfer ownership (fresh) to the caller? A missing
+    # entry answers false -> the result is treated as a borrow -> at worst a leak, never a UAF.
+    pub def fn_ret_owned(self, name: str) -> bool:
+        mut i = 0
+        while i < self.fn_owned_names.len:
+            if self.fn_owned_names.get(i) == name: return true
+            i = i + 1
+        return false
+
+    # Index into unavail_names (-1 = the fn lowered fine / unknown).
+    pub def unavail_index(self, name: str) -> int:
+        if (name as Pointer[char]) as usize == 0 as usize: return -1
+        mut i = 0
+        while i < self.unavail_names.len:
+            if self.unavail_names.get(i) == name: return i
+            i = i + 1
+        return -1
+
+    # -- object model: class layout registry --------------------------------------------
+    pub def add_class(self, cl: ClassLayout):
+        self.classes.push(cl)
+
+    pub def class_index(self, name: str) -> int:
+        if (name as Pointer[char]) as usize == 0 as usize: return -1   # null name -> not a class
+        mut i = 0
+        while i < self.classes.len:
+            if self.classes.get(i).name == name: return i
+            i = i + 1
+        return -1
+
+    pub def is_class(self, name: str) -> bool:
+        return self.class_index(name) >= 0
+
+    # True for a @value_type class: stored INLINE by value (no heap handle; copy on assign).
+    pub def is_value_class(self, name: str) -> bool:
+        mut ci = self.class_index(name)
+        if ci < 0: return false
+        return self.classes.get(ci).is_value
+
+    # Instance size in bytes (every field is an 8-byte slot).
+    pub def class_size(self, name: str) -> int:
+        mut ci = self.class_index(name)
+        if ci < 0: return 8
+        mut n = self.classes.get(ci).fields.len
+        if n < 1: n = 1
+        return n * 8
+
+    # Byte offset of a field, or -1 if the class/field is unknown.
+    pub def field_offset(self, cls: str, fld: str) -> int:
+        mut ci = self.class_index(cls)
+        if ci < 0: return -1
+        mut fi = self.classes.get(ci).field_index(fld)
+        if fi < 0: return -1
+        return fi * 8
+
+    # Value-type tag of a field, or -1 if unknown.
+    pub def field_tag(self, cls: str, fld: str) -> int:
+        mut ci = self.class_index(cls)
+        if ci < 0: return -1
+        mut fi = self.classes.get(ci).field_index(fld)
+        if fi < 0: return -1
+        return self.classes.get(ci).ftags.get(fi)
+
+    # Resolve `cls.method` to its mangled function, walking UP the base chain (static
+    # dispatch — matches the C backend's struct-embedding model, which has no vtables).
+    # Returns "" if no class in the chain defines the method.
+    pub def resolve_method(self, cls: str, method: str) -> str:
+        mut cur = cls
+        mut depth = 0
+        while depth < 32:                       # cycle guard
+            mut ci = self.class_index(cur)
+            if ci < 0: return ""
+            mut mangled = cur + "_" + method
+            if self.is_user_fn(mangled): return mangled
+            cur = self.classes.get(ci).base
+            if (cur as Pointer[char]) as usize == 0 as usize or cur == "": return ""
+            depth = depth + 1
+        return ""
+
+    # Class/enum name of an object-valued field ("" if scalar/unknown).
+    pub def field_cls(self, cls: str, fld: str) -> str:
+        mut ci = self.class_index(cls)
+        if ci < 0: return ""
+        mut fi = self.classes.get(ci).field_index(fld)
+        if fi < 0: return ""
+        return self.classes.get(ci).fcls.get(fi)
+
+    # -- object model: enum layout registry ----------------------------------------------
+    pub def add_enum(self, el: EnumLayout):
+        self.enums.push(el)
+
+    pub def enum_index(self, name: str) -> int:
+        if (name as Pointer[char]) as usize == 0 as usize: return -1   # null name -> no
+        mut i = 0
+        while i < self.enums.len:
+            if self.enums.get(i).name == name: return i
+            i = i + 1
+        return -1
+
+    pub def is_enum(self, name: str) -> bool:
+        return self.enum_index(name) >= 0
+
+    # Instance size in bytes: tag slot + the LARGEST variant payload (variants overlay).
+    pub def enum_size(self, name: str) -> int:
+        mut ei = self.enum_index(name)
+        if ei < 0: return 8
+        mut mx = 0
+        mut vi = 0
+        while vi < self.enums.get(ei).variants.len:
+            mut n = self.enums.get(ei).variants.get(vi).fields.len
+            if n > mx: mx = n
+            vi = vi + 1
+        return (1 + mx) * 8
+
+    pub def enum_variant_index(self, ename: str, vname: str) -> int:
+        mut ei = self.enum_index(ename)
+        if ei < 0: return -1
+        return self.enums.get(ei).variant_index(vname)
+
+    # -- interfaces: name registry (dispatch is fully static via specialization) ---------
+    pub def add_iface(self, name: str):
+        self.ifaces.push(name)
+
+    pub def is_iface(self, name: str) -> bool:
+        if (name as Pointer[char]) as usize == 0 as usize: return false
+        mut i = 0
+        while i < self.ifaces.len:
+            if self.ifaces.get(i) == name: return true
+            i = i + 1
+        return false

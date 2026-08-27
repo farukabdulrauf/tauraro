@@ -34,7 +34,10 @@ extend Fmt:
             else: sb.append_char(57)
             x = x / 10
         if neg: sb.append_char(45)
-        return Str.reverse(sb.to_owned())
+        mut tmp = sb.to_owned()
+        sb.free()
+        mut out = Str.reverse(tmp)
+        return out
 
     pub def int_to_hex(n: int) -> str:
         if n == 0: return "0"
@@ -45,7 +48,10 @@ extend Fmt:
             if d < 10: sb.append_char(48 + d)
             else: sb.append_char(87 + d)
             x = x / 16
-        return Str.reverse(sb.to_owned())
+        mut tmp = sb.to_owned()
+        sb.free()
+        mut out = Str.reverse(tmp)
+        return out
 
     pub def int_to_bin(n: int) -> str:
         if n == 0: return "0"
@@ -56,7 +62,10 @@ extend Fmt:
             if bit == 0: sb.append_char(48)
             else: sb.append_char(49)
             x = x / 2
-        return Str.reverse(sb.to_owned())
+        mut tmp = sb.to_owned()
+        sb.free()
+        mut out = Str.reverse(tmp)
+        return out
 
     pub def int_to_oct(n: int) -> str:
         if n == 0: return "0"
@@ -66,7 +75,10 @@ extend Fmt:
             mut d = x - (x / 8) * 8
             sb.append_char(48 + d)
             x = x / 8
-        return Str.reverse(sb.to_owned())
+        mut tmp = sb.to_owned()
+        sb.free()
+        mut out = Str.reverse(tmp)
+        return out
 
     # ── Float → string ────────────────────────────────────────────────────────
 
@@ -91,18 +103,28 @@ extend Fmt:
             sb.append_char(pad_char)
             i = i + 1
         sb.append(s)
-        return sb.to_owned()
+        # `s` is borrowed: the caller owns/releases it (fresh args are released
+        # at the call site; variable args stay owned by the caller). append()
+        # copies, so we must NOT free `s` here — doing so double-frees (the
+        # `slen >= width` path returns a retained `s`, this path consumed it),
+        # which corrupted the heap via Fmt.zero_pad -> DateTime.to_string.
+        mut out = sb.to_owned()
+        sb.free()
+        return out
 
     pub def pad_right(s: str, width: int, pad_char: int) -> str:
         mut slen = Str.len(s)
         if slen >= width: return s
         mut sb = StringBuilder.init(width + 1)
         sb.append(s)
+        # `s` is borrowed (see pad_left) — do not free it here.
         mut i  = slen
         while i < width:
             sb.append_char(pad_char)
             i = i + 1
-        return sb.to_owned()
+        mut out = sb.to_owned()
+        sb.free()
+        return out
 
     pub def zero_pad(n: int, width: int) -> str:
         return Fmt.pad_left(Fmt.int_to_str(n), width, 48)

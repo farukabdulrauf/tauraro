@@ -1,5 +1,7 @@
 # 16 — Concurrency
 
+> **See also:** [Concurrency Guide — Models, Primitives, Patterns & Best Practices](advanced/07_concurrency_guide.md) for the full picture (OS threads vs green threads vs thread-per-core, a decision matrix, and best-practice combinations), and [`examples/concurrency/`](../../examples/concurrency/) for runnable examples of every pattern.
+
 ---
 
 ## Overview
@@ -28,9 +30,21 @@ Tauraro provides a layered concurrency model:
 
 | Code | Meaning |
 |------|---------|
-| `[T-1]` | Value passed to `spawn` is not `Sendable` |
-| `[T-2]` | Race condition detected statically |
-| `[T-3]` | Deadlock detected statically |
+| `[T-1]` | Value passed to `spawn`/`Thread.spawn`/`Shared[T]` is not `Sendable` |
+| `[T-2]` | A class `implements Sendable` but declares a field whose type is not `Sendable` — checked **transitively** through `Shared[T]`/`Weak[T]`/`Chan[T]` (their inner `T` must also be Sendable, so non-thread-safe data can't be reached through a handle) |
+| `[T-3]` | *(warning)* A `Sendable` class has a primitive field that may race if mutated from multiple threads — wrap it in `Atomic[T]` |
+| `[T-6]` | A borrow (`ref`/`mut ref`) crosses a thread boundary — it could dangle or race. Pass an owned value, `Shared[T]`, or `Mutex[T]` instead (like Rust's `thread::spawn` requiring `'static`) |
+| `[T-7]` | A **plain reference-counted class** crosses a thread boundary. Its refcount is non-atomic (`!Send`, exactly like Rust's `Rc`) so two threads retaining/releasing it would race the count. Checked **transitively** (through `Mutex`/`Vec`/`Dict`/fields). Use `Shared[T]` — the atomic `Arc` equivalent |
+
+> **The concurrency guarantee.** `[T-1]`+`[T-2]` (only Sendable data crosses) with
+> `[T-6]` (no borrows cross) and `[T-7]` (no non-atomic refcount crosses) mean that
+> under `--strict`, **a program that compiles is free of thread-safety bugs** — no
+> data race, no cross-thread use-after-free, no refcount race. Every value shared
+> between threads is an atomic `Shared[T]` or a synchronization primitive. This is
+> the same safety outcome as Rust's `Send`/`Sync`, reached with **zero lifetime
+> annotations**. A framework that audits its own internals can opt a specific class
+> out of `[T-7]`/`[T-2]` with `implements Sendable, UnsafeSendable` (Tauraro's
+> `unsafe impl Send/Sync`); code that compiles without it keeps the full guarantee.
 
 ---
 

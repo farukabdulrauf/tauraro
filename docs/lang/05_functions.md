@@ -7,13 +7,14 @@ Functions are the fundamental unit of reusable logic in Tauraro. They are static
 ## Table of Contents
 
 1. [Defining Functions](#defining-functions)
+1a. [Local (Nested) Declarations in `main()`](#local-nested-declarations-in-main)
 2. [Parameters and Return Types](#parameters-and-return-types)
 3. [Decorators](#decorators)
 4. [Closures and Lambdas](#closures-and-lambdas)
 5. [Generic Functions](#generic-functions)
 6. [Error Propagation with `throws`](#error-propagation-with-throws)
 7. [Async Functions](#async-functions)
-8. [Variadic Functions (FFI Only)](#variadic-functions-ffi-only)
+8. [Variadic Functions](#variadic-functions)
 9. [Visibility: `pub` and `export`](#visibility-pub-and-export)
 10. [Function Rules Quick Reference](#function-rules-quick-reference)
 
@@ -74,6 +75,75 @@ Fix: Use overloaded static methods in a class, or require the caller to pass the
 
 ---
 
+## Local (Nested) Declarations in `main()`
+
+### When to use
+
+When a `class`, `enum`, `interface`, `extend`, or helper `def` is only meaningful
+for a small script's `main()` function, you can declare it directly inside
+`main()` instead of cluttering module scope — similar to local classes in Java.
+
+### How it works
+
+`class`, `enum`, `interface`, `extend`, and `def` statements are allowed inside
+the body of `main()`:
+
+```python
+def main():
+    class Vec2:
+        pub x: int
+        pub y: int
+
+    extend Vec2:
+        pub def init(x: int, y: int) -> Vec2:
+            mut v = Vec2()
+            v.x = x
+            v.y = y
+            return v
+
+        pub def length_sq(self) -> int:
+            return self.x * self.x + self.y * self.y
+
+    enum Color:
+        Red
+        Green
+        Blue
+
+    def describe(c: Color) -> str:
+        match c:
+            case Color.Red: return "red"
+            case Color.Green: return "green"
+            case Color.Blue: return "blue"
+        return ""
+
+    mut v = Vec2.init(3, 4)
+    print(v.length_sq())          # 25
+    print(describe(Color.Green))  # green
+```
+
+The compiler hoists these declarations to module scope behind the scenes and
+generates ordinary top-level C definitions for them — there is no extra runtime
+cost. The names just remain scoped to `main()` for readability.
+
+### Common Mistakes
+
+**Declaring a nested type/function outside `main()`:**
+```python
+def helper():
+    class Foo:    # ERROR [E-2]: nested declarations are main()-only
+        pub x: int
+```
+Fix: move `Foo` to module (top-level) scope, or move the whole helper's logic
+into `main()`.
+
+### Best Practices
+
+- Reserve nested declarations for small scripts, examples, and one-off tools
+  where the type genuinely has no meaning outside `main()`.
+- For anything reused across functions or modules, declare it at module scope.
+
+---
+
 ## Parameters and Return Types
 
 ### When to use
@@ -89,7 +159,10 @@ def compute(x: int, y: float, label: str) -> void:
     print(f"{label}: {x as float + y}")
 ```
 
-All parameter types must be annotated. Omitting a type is a parse error (`[F-1]`).
+All parameter types must be annotated. Omitting a type is a parse error (generic
+"expected ':' after parameter name" — `[F-1]` is reserved for this but not yet
+emitted as a distinct diagnostic code; see [19 — Compiler
+Errors](19_compiler_errors.md#reserved--not-yet-implemented)).
 
 **Return values:**
 
@@ -119,9 +192,12 @@ def find_first(items: List[int], target: int) -> int:
     return -1    # not found
 ```
 
-**Compiler rule [F-1]:** All parameters must have type annotations. Omitting a type is a parse error.
+**Compiler rule [F-1]** *(reserved, not yet a distinct diagnostic)*: All parameters
+must have type annotations. Omitting a type is currently a generic parse error.
 
-**Compiler rule [F-2]:** Parameters may not be shadowed by local variables of the same name.
+**Compiler rule [F-2]** *(reserved, not yet implemented)*: Parameters may not be
+shadowed by local variables of the same name. The compiler does not currently
+detect this — the example below compiles without error today.
 
 **Compiler rule [F-3]:** A non-void function must have a `return` on every reachable code path:
 
@@ -136,10 +212,11 @@ ERROR [F-3]: Function 'max_of' returns 'int' but is missing a return statement
 **Shadowing a parameter name:**
 ```python
 def scale(value: int, factor: int) -> int:
-    mut value = value * factor    # ERROR [F-2]: shadows parameter 'value'
+    mut value = value * factor    # not currently an error ([F-2] reserved),
+                                   # but shadows the parameter and hurts readability
     return value
 ```
-Fix: Use a different name: `mut result = value * factor`
+Prefer a different name regardless: `mut result = value * factor`
 
 **Non-void function with a missing return branch:**
 ```python
@@ -335,6 +412,19 @@ accumulate(5)
 accumulate(10)
 print(total)    # 15 — outer variable was modified
 ```
+
+> **Portable (GCC + Clang).** A closure compiles to a **top-level function plus a
+> heap-allocated capture environment** that holds pointers to the captured
+> variables (capture-by-reference). This works on both GCC and Clang — closures
+> no longer require GCC-only nested functions. A closure value and a plain
+> function name are interchangeable wherever a `def(...)->R` is expected.
+>
+> Two things to know: (1) captures are **by reference**, so a closure that
+> *escapes* the function that created it (is returned or stored past that call)
+> must not outlive the captured variables — same rule as before. (2) The capture
+> environment is currently heap-allocated and not yet reclaimed, so creating many
+> closures in a hot loop leaks a small amount; binding a closure once and reusing
+> it is fine. (Env reclamation via scope-based drop is a planned follow-up.)
 
 **Stateful counter:**
 ```python
@@ -631,22 +721,65 @@ async def square(x: int) -> int:    # unnecessary — no I/O or suspension
 
 ---
 
-## Variadic Functions (FFI Only)
+## Variadic Functions
 
-### When to use
+Tauraro supports two flavors of trailing variadic parameters, both spelled
+`name...` (a trailing param name followed by `...`):
 
-Use variadic declarations when calling C library functions that accept a variable number of arguments (`printf`, `sprintf`, `ioctl`, etc.). You cannot define variadic functions in Tauraro itself.
+1. **Regular functions** — `args...` collects the trailing call arguments
+   into a `List[T]`.
+2. **`extern "C"` declarations** — a trailing `args...` param maps to C's
+   literal `...` variadic signature, for calling functions like `printf`.
 
-### How it works
+### Regular Tauraro functions: `args...` -> `List[T]`
+
+#### When to use
+
+Use this when a function should accept any number of trailing arguments of
+the same type — logging helpers, math reducers, constructors that take a
+variable number of items, etc.
+
+#### How it works
+
+```python
+def total(label: str, args: int...) -> int:
+    mut sum = 0
+    for v in args:
+        sum = sum + v
+    print(label + ": " + sum.to_str())
+    return sum
+
+def main():
+    total("a", 1, 2, 3)       # args = [1, 2, 3]
+    total("b", 10)            # args = [10]
+    total("c")                # args = []
+```
+
+The element type comes from the annotation before `...` (`int` above; it
+defaults to `int` if omitted). At each call site, the compiler collects all
+arguments past the fixed parameters into a single `List[T]` literal — the
+caller passes plain values, not a list.
+
+### `extern "C"` declarations: `args...` -> C's `...`
+
+#### When to use
+
+Use a trailing `args...` in an `extern "C"` block when calling C library
+functions that accept a variable number of arguments (`printf`, `sprintf`,
+`ioctl`, etc.). You cannot define a function with literal C `...` in
+Tauraro itself — only declare one via `extern "C"`.
+
+#### How it works
 
 ```python
 extern "C":
-    def printf(fmt: str, ...) -> int
-    def snprintf(buf: str, n: int, fmt: str, ...) -> int
-    def fprintf(stream: ptr, fmt: str, ...) -> int
+    def printf(fmt: str, args...) -> int
+    def snprintf(buf: str, n: int, fmt: str, args...) -> int
 ```
 
-`...` in an `extern "C"` declaration marks the function as variadic. The Tauraro compiler emits the correct C variadic call:
+A trailing `args...` in an `extern "C"` declaration emits C's `...`
+variadic signature (`int printf(const char* fmt, ...)`). Call sites pass
+arguments through unchanged:
 
 ```python
 printf("value = %d\n", 42)
@@ -656,17 +789,22 @@ snprintf(buf, 256, "result: %f", result)
 
 ### Common Mistakes
 
-**Trying to define a variadic Tauraro function:**
+**Forgetting the trailing param name:**
 ```python
-def log(msg: str, ...) -> void:    # ERROR: variadic user functions not supported
+def log(msg: str, ...) -> void:    # ERROR: bare `...` is not valid syntax
     ...
 ```
-Fix: Use `List[str]` or overloaded methods instead of variadic parameters.
+Fix: name the trailing param, e.g. `def log(msg: str, args: str...) -> void:`.
 
 ### Best Practices
 
-- Prefer Tauraro's `f"..."` and `print()` for formatted output — they are safer and type-checked. Use `printf` only when you need direct C interop.
-- Always include the `-> int` return type on variadic C functions that return a value — the compiler uses it for correct call-site code generation.
+- Prefer `args...` -> `List[T]` for Tauraro-side variadic APIs — it is
+  type-checked and iterable like any other `List[T]`.
+- Prefer Tauraro's `f"..."` and `print()` for formatted output over
+  `printf` — they are safer and type-checked. Use `extern "C"` variadics
+  only when you need direct C interop.
+- Always include the `-> int` return type on variadic C functions that
+  return a value — the compiler uses it for correct call-site codegen.
 
 ---
 
@@ -725,14 +863,82 @@ Fix: Add `pub` to `def helper()` in utils.tr.
 
 ---
 
+## First-Class Functions (Callables)
+
+A top-level function can be used as a **value** — passed to other functions, stored
+in a variable, reassigned, and stored in a class field. A function value is a
+**zero-cost function pointer** (a pointer to the top-level function; no heap, no
+captured environment).
+
+### The `def(...) -> R` type
+
+A callable's type is written with `def`, mirroring how functions are declared:
+
+```python
+def add1(x: int) -> int:
+    return x + 1
+
+def main():
+    mut h: def(int) -> int = add1   # a variable holding a function
+    print(h(41))                    # 42 — call through the value
+    h = mul2                        # reassign to another function
+```
+
+The type is `def(ParamTypes...) -> ReturnType`. Use `def() -> R` for no parameters,
+and omit `-> R` for a function returning nothing.
+
+### Passing functions as arguments
+
+```python
+def apply(f: def(int) -> int, v: int) -> int:
+    return f(v)
+
+apply(add1, 10)   # 11 — pass the function by name, call it inside
+```
+
+This is the idiomatic way to take a callback or handler.
+
+### Storing callables in a struct (e.g. a router)
+
+Put the callable in a **field**, then keep a normal collection of those structs:
+
+```python
+pub class Route:
+    pub pattern: str
+    pub handler: def(HttpConn) -> void
+
+extend Route:
+    pub def init(p: str, h: def(HttpConn) -> void) -> Route:
+        mut r = Route(); r.pattern = p; r.handler = h; return r
+
+def main():
+    mut routes = Vec[Route].init(4)
+    routes.push(Route.init("/", home))
+    routes.push(Route.init("/about", about))
+    mut rt = routes.get(0)
+    rt.handler(conn)        # call the stored handler directly
+```
+
+> **Note:** a callable *element type* in a generic type argument —
+> `Vec[def(int) -> int].init()` — **is** supported (see
+> [Generics §Function-Pointer Type Arguments](11_generics.md#function-pointer-type-arguments)).
+> Use it for a homogeneous list of callables with no extra per-entry data.
+> When each entry also needs metadata (a route pattern, a name, a priority),
+> wrap the callable in a small struct field (as above) and use
+> `Vec[YourStruct]` instead.
+
+---
+
 ## Function Rules Quick Reference
 
 | Rule | Description | Error |
 |------|-------------|-------|
-| F-1 | All parameters must have type annotations | `[F-1] Parameter type missing` |
-| F-2 | Parameters may not be shadowed by local variables | `[F-2] Parameter name shadowed` |
+| F-1 *(reserved)* | All parameters must have type annotations | generic parse error (not yet a distinct `[F-1]` code) |
+| F-2 *(reserved)* | Parameters may not be shadowed by local variables | not currently detected |
 | F-3 | Non-void function must return on all code paths | `[F-3] Missing return on code path` |
 | T-4 | Result from a `throws` call must be handled | `[T-4] Unhandled Result from throws call` |
+| E-1 | Method must exist on the receiver's type (or a base class) | `[E-1] No method 'x' found on type 'Y'` |
+| E-2 | Nested class/def/enum/interface/extend declarations are `main()`-only | `[E-2] Nested declarations are only supported inside main()` |
 
 ---
 

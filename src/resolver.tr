@@ -1,11 +1,12 @@
-# compiler/src/resolver.tr — Module Resolver for the Tauraro self-hosted compiler.
+# @trusted: compiler systems module — audited raw-pointer core (like Rust std internals)
+# compiler/src/resolver.tr - Module Resolver for the Tauraro self-hosted compiler.
 #
 # Unity Build model: every imported file is parsed and its declarations are
 # merged into a single flat list consumed by the sema + codegen.
 #
 # Module lookup order for `from a.b.c import X`:
-#   1. <search_path>/a/b/c/mod.tr   ← package directory with index file
-#   2. <search_path>/a/b/c.tr       ← single-file module (fallback)
+#   1. <search_path>/a/b/c/mod.tr   <- package directory with index file
+#   2. <search_path>/a/b/c.tr       <- single-file module (fallback)
 #
 # Visibility: declarations without `pub` are treated as private to their
 # source file.  When collecting decls from an imported (non-root) file only
@@ -20,7 +21,13 @@ from lexer import Lexer
 from parser import Parser
 from ast import Program, Decl, FunctionDef, ClassDef, EnumDef, InterfaceDef, ImportItem
 
-# ─── Visibility helper ────────────────────────────────────────────────────────
+extern "C":
+    def _tr_dir_exists(path: str) -> bool
+    def _tr_opendir(path: str) -> Pointer[void]
+    def _tr_readdir(handle: Pointer[void]) -> str
+    def _tr_closedir(handle: Pointer[void])
+
+# --- Visibility helper --------------------------------------------------------
 
 pub def decl_is_pub(d: Decl) -> bool:
     match d:
@@ -43,7 +50,7 @@ pub def decl_is_pub(d: Decl) -> bool:
         case _:
             return false  # DImport/DFromImport/DTopLevelStmt filtered elsewhere
 
-# ─── ModuleResolver ───────────────────────────────────────────────────────────
+# --- ModuleResolver -----------------------------------------------------------
 
 pub class ModuleResolver:
     pub visited:          Map[str, bool]
@@ -54,6 +61,7 @@ pub class ModuleResolver:
     pub mod_file_paths:   Vec[str]   # "compiler/src/resolver.tr"
     pub all_decl_modules: Vec[str]   # dotted path for each all_decls entry ("" = root)
     pub current_mod:      str        # dotted path of module currently being loaded
+    pub parse_errors:     int        # total parse errors across all modules (0 = clean)
 
 extend ModuleResolver:
     pub def init() -> ModuleResolver:
@@ -65,6 +73,7 @@ extend ModuleResolver:
         r.mod_file_paths   = Vec[str].init(32)
         r.all_decl_modules = Vec[str].init(1024)
         r.current_mod      = ""
+        r.parse_errors     = 0
         r.search_paths.push(".")
         r.search_paths.push("tauraro")
         r.search_paths.push("..")
@@ -73,7 +82,39 @@ extend ModuleResolver:
         return r
 
     pub def add_search_path(self, p: str):
+        if p == "": return
+        mut i = 0
+        while i < self.search_paths.len:
+            if self.search_paths.get(i) == p: return   # dedup
+            i = i + 1
         self.search_paths.push(p)
+
+    # Directory portion of a file path ("" if none), handling '/' and '\'.
+    pub def dir_of_path(self, path: str) -> str:
+        mut p = path as Pointer[char]
+        mut n = 0
+        while p.offset(n).read() as int != 0: n = n + 1
+        mut last = 0 - 1
+        mut i = 0
+        while i < n:
+            mut c = p.offset(i).read() as int
+            if c == 47 or c == 92: last = i   # '/' or '\'
+            i = i + 1
+        if last < 0: return ""
+        return path.slice(0, last)
+
+    # Final path segment (basename), e.g. "watax" from "a/b/watax".
+    pub def base_of_path(self, path: str) -> str:
+        mut p = path as Pointer[char]
+        mut n = 0
+        while p.offset(n).read() as int != 0: n = n + 1
+        mut last = 0 - 1
+        mut i = 0
+        while i < n:
+            mut c = p.offset(i).read() as int
+            if c == 47 or c == 92: last = i
+            i = i + 1
+        return path.slice(last + 1, n)
 
     # Entry point.  The root file's private declarations ARE included.
     pub def resolve_main(self, main_path: str) -> Program:
@@ -95,7 +136,7 @@ extend ModuleResolver:
             # Use unsafe slice to copy the directory prefix without a StringBuilder.
             mut dir_str = ""
             unsafe:
-                dir_str = _tr_str_slice(main_path, 0, dir_end)
+                dir_str = main_path.slice(0, dir_end)
             self.search_paths.push(dir_str)
             # Also add parent and grandparent of the source file directory.
             # This allows finding the repo-root std lib (e.g. core/) when the
@@ -107,10 +148,15 @@ extend ModuleResolver:
                 mut dch = dp.offset(pj).read() as int
                 if dch == 47 or dch == 92: par_end = pj
                 pj = pj + 1
+            # `parent_dir` is the directory containing `dir_str` (the source
+            # file's directory). When `dir_str` itself has no separator (e.g.
+            # a relative invocation like `tauraroc src/main.tr` from the
+            # project root, where `dir_str == "src"`), there is no literal
+            # parent path to slice out - it's simply the current directory.
+            mut parent_dir = "."
             if par_end > 0:
-                mut parent_dir = ""
                 unsafe:
-                    parent_dir = _tr_str_slice(dir_str, 0, par_end)
+                    parent_dir = dir_str.slice(0, par_end)
                 self.search_paths.push(parent_dir)
                 mut gp_end = 0
                 mut gj = 0
@@ -122,8 +168,25 @@ extend ModuleResolver:
                 if gp_end > 0:
                     mut gp_dir = ""
                     unsafe:
-                        gp_dir = _tr_str_slice(parent_dir, 0, gp_end)
+                        gp_dir = parent_dir.slice(0, gp_end)
                     self.search_paths.push(gp_dir)
+
+            # Auto-discover vendored taupkg dependencies: when a project is
+            # built via `taupkg build`, deps are copied into
+            # <build_dir>/<pkgname>/src/. Add each such <pkgname>/src as a
+            # search path so the dependency's own sibling-relative imports
+            # (e.g. `from app import App` inside watax.tr) resolve, and so
+            # `from <pkgname> import X` finds <build_dir>/<pkgname>/src/<pkgname>.tr.
+            mut vh = _tr_opendir(parent_dir)
+            if vh as usize != 0 as usize:
+                mut vname = _tr_readdir(vh)
+                while vname != "":
+                    if vname != "." and vname != "..":
+                        mut vpkg_src = parent_dir + "/" + vname + "/src"
+                        if _tr_dir_exists(vpkg_src):
+                            self.search_paths.push(vpkg_src)
+                    vname = _tr_readdir(vh)
+                _tr_closedir(vh)
         self.resolve_file(main_path, true)
         mut p = Program.init()
         mut i = 0
@@ -133,8 +196,8 @@ extend ModuleResolver:
         return p
 
     # Resolve a file from disk.
-    # is_root = true  → include all declarations (the user's entry file)
-    # is_root = false → include only pub declarations (imported dependency)
+    # is_root = true  -> include all declarations (the user's entry file)
+    # is_root = false -> include only pub declarations (imported dependency)
     pub def resolve_file(self, path: str, is_root: bool):
         if self.visited.contains(path): return
         self.visited.insert(path, true)
@@ -156,10 +219,21 @@ extend ModuleResolver:
                 source = read_file(path + ".tr")
             if source == "": return
 
+        # A module is TRUSTED (audited unsafe core, exempt from the default raw-pointer
+        # check [P-2]) if it is std/core library code OR carries the `# @trusted` module
+        # pragma near the top (the compiler's own systems modules use this — like Rust's
+        # `unsafe` internals in std). User modules are NOT trusted → their raw pointer
+        # derefs need `unsafe:`.
+        mut file_trusted = self._path_is_lib(path) or self._source_is_trusted(source)
+
         mut lexer   = Lexer.init(source)
         mut tokens  = lexer.tokenize()
         mut parser  = Parser.init(tokens, lexer.token_lines)
+        parser.current_file = path
+        parser.cols = lexer.token_cols
+        parser.src_text = source
         mut prog    = parser.parse_program()
+        self.parse_errors = self.parse_errors + parser.error_count
 
         # Scan declarations: load imported modules first, then collect decls.
         mut i = 0
@@ -171,12 +245,64 @@ extend ModuleResolver:
                 case Decl.DFromImport(mod_path, items):
                     self.resolve_module_path(mod_path)
                 case _:
-                    if is_root or decl_is_pub(decl_ptr.read()):
-                        self.all_decls.push(decl_ptr)
-                        self.all_decl_modules.push(self.current_mod)
+                    # Always collect ALL declarations from a module - including private
+                    # helpers (def without pub). Private functions are only called within
+                    # their own module's generated .c file, so they MUST be in all_decls
+                    # for generate_module_c to emit their bodies. Filtering them out here
+                    # causes "implicit declaration" / missing-body GCC errors.
+                    # Trusted std/core OR a `# @trusted` systems module: tag its functions
+                    # is_lib so the raw-pointer check [P-2] treats them as an audited unsafe
+                    # core (like Rust's std), applying only to ordinary user code.
+                    if file_trusted:
+                        self._mark_decl_lib(decl_ptr)
+                    self.all_decls.push(decl_ptr)
+                    self.all_decl_modules.push(self.current_mod)
             i = i + 1
 
-    # Compatibility shim — resolve_recursive kept so existing callers compile.
+    # True when `path` is under the trusted standard library (std/ or the bootstrap
+    # core/ stdlib) — those modules are the audited unsafe core, exempt from [P-2].
+    pub def _path_is_lib(self, path: str) -> bool:
+        return self._contains(path, "std/") or self._contains(path, "std\\") or self._contains(path, "core/") or self._contains(path, "core\\")
+
+    # True if the module source carries the `# @trusted` pragma near the top.
+    pub def _source_is_trusted(self, source: str) -> bool:
+        mut n = source.len()
+        mut lim = 400
+        if n < lim: lim = n
+        if lim <= 0: return false
+        return self._contains(source.slice(0, lim), "@trusted")
+
+    pub def _contains(self, hay: str, needle: str) -> bool:
+        mut hl = hay.len()
+        mut nl = needle.len()
+        if nl == 0 or nl > hl: return false
+        mut i = 0
+        while i + nl <= hl:
+            if hay.slice(i, i + nl) == needle: return true
+            i = i + 1
+        return false
+
+    # Tag every FunctionDef reachable in a decl as is_lib (trusted library code).
+    pub def _mark_decl_lib(self, dp: Pointer[Decl]):
+        if dp as usize == 0 as usize: return
+        match dp.read():
+            case Decl.DFunction(f): f.is_lib = true
+            case Decl.DClass(c): self._mark_methods_lib(c)
+            case Decl.DActor(c): self._mark_methods_lib(c)
+            case Decl.DExtend(_, ms):
+                mut i = 0
+                while i < ms.len:
+                    ms.get(i).is_lib = true
+                    i = i + 1
+            case _: pass
+
+    pub def _mark_methods_lib(self, c: ClassDef):
+        mut i = 0
+        while i < c.methods.len:
+            c.methods.get(i).is_lib = true
+            i = i + 1
+
+    # Compatibility shim - resolve_recursive kept so existing callers compile.
     pub def resolve_recursive(self, path: str):
         self.resolve_file(path, false)
 
@@ -184,18 +310,19 @@ extend ModuleResolver:
     # path and search for the file in self.search_paths.
     #
     # Lookup order per search path:
-    #   1. <base>/<dir>/mod.tr   ← package with index file
-    #   2. <base>/<dir>.tr       ← single-file module
+    #   1. <base>/<dir>/mod.tr   <- package with index file
+    #   2. <base>/<dir>.tr       <- single-file module
     pub def resolve_module_path(self, mod_path: str):
-        # Build directory path: dots → slashes (no extension yet)
+        # Build directory path: dots -> slashes (no extension yet)
         mut n = 0
         mut p = mod_path as Pointer[char]
         while p.offset(n).read() as int != 0: n = n + 1
-        mut dir_path = _tr_str_slice(mod_path, 0, n)
+        mut dir_path = mod_path.slice(0, n)
         mut bp = dir_path as Pointer[char]
         mut j = 0
         while j < n:
-            if bp.offset(j).read() as int == 46: bp.offset(j).write(47 as char)  # '.' → '/'
+            if bp.offset(j).read() as int == 46:
+                unsafe: bp.offset(j).write(47 as char)  # '.' -> '/'
             j = j + 1
 
         # Save/restore current_mod so recursive resolution doesn't corrupt parent tracking.
@@ -214,7 +341,7 @@ extend ModuleResolver:
                 self.resolve_file(pkg_path, false)
                 if not already:
                     self.mod_dot_paths.push(mod_path)
-                    self.mod_file_paths.push(StringObj.init(pkg_path).as_str())
+                    self.mod_file_paths.push(pkg_path)
                 self.current_mod = saved_mod
                 return
  
@@ -225,12 +352,34 @@ extend ModuleResolver:
                 self.resolve_file(flat_path, false)
                 if not already:
                     self.mod_dot_paths.push(mod_path)
-                    self.mod_file_paths.push(StringObj.init(flat_path).as_str())
+                    self.mod_file_paths.push(flat_path)
+                self.current_mod = saved_mod
+                return
+
+            # 3. taupkg package layout (no mod.tr): <base>/<dir>/src/<pkg>.tr,
+            #    e.g. `from watax import X` -> <base>/watax/src/watax.tr. This is
+            #    what lets just the PACKAGES ROOT be on TAURARO_PATH: the index
+            #    module is found here, and resolve_file adds <base>/watax/src to
+            #    the search paths so its sibling imports (json_ext, http_ext, …,
+            #    which carry the `extend HttpConn` blocks) resolve too.
+            mut pkg_src_path = base + "/" + dir_path + "/src/" + self.base_of_path(dir_path) + ".tr"
+            if file_exists(pkg_src_path):
+                # Put the package's own src/ dir on the search path so the index
+                # module's sibling imports (json_ext, http_ext, … which carry the
+                # `extend HttpConn` blocks) resolve. This is scoped to packages
+                # found via this lookup, so it doesn't perturb resolution when the
+                # caller already lists each src/ dir explicitly.
+                self.add_search_path(base + "/" + dir_path + "/src")
+                mut already3 = self.visited.contains(pkg_src_path)
+                self.resolve_file(pkg_src_path, false)
+                if not already3:
+                    self.mod_dot_paths.push(mod_path)
+                    self.mod_file_paths.push(pkg_src_path)
                 self.current_mod = saved_mod
                 return
 
             sidx = sidx + 1
 
         self.current_mod = saved_mod
-        # Module not found on any search path — silently skip.
+        # Module not found on any search path - silently skip.
         # (The sema will emit an "unknown symbol" error if the import is used.)

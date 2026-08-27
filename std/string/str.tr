@@ -4,7 +4,9 @@ from std.core.string import StringBuilder
 
 extern "C":
     def _tr_str_split(s: str, sep: str) -> List[str]
-    def _tr_str_join(parts: List[str], sep: str) -> str
+    def _tr_strx_join_trstr(parts: List[str], sep: str) -> str
+    def _tr_c_free(ptr: Pointer[char])
+    def _tr_str_slice(s: Pointer[char], start: int, end: int) -> str
 
 pub class Str:
     _dummy: int
@@ -162,7 +164,9 @@ extend Str:
         while i < real_e:
             sb.append_char(p.offset(i).read() as int)
             i = i + 1
-        return sb.to_owned()
+        mut out = sb.to_owned()
+        sb.free()
+        return out
 
     pub def repeat(s: str, n: int) -> str:
         if n <= 0: return ""
@@ -171,7 +175,9 @@ extend Str:
         while i < n:
             sb.append(s)
             i = i + 1
-        return sb.to_owned()
+        mut out = sb.to_owned()
+        sb.free()
+        return out
 
     pub def reverse(s: str) -> str:
         mut slen = Str.len(s)
@@ -181,7 +187,9 @@ extend Str:
         while i >= 0:
             sb.append_char(p.offset(i).read() as int)
             i = i - 1
-        return sb.to_owned()
+        mut out = sb.to_owned()
+        sb.free()
+        return out
 
     # ── Case conversion ──────────────────────────────────────────────────────
 
@@ -195,7 +203,9 @@ extend Str:
             if ch >= 97 and ch <= 122: ch = ch - 32
             sb.append_char(ch)
             i = i + 1
-        return sb.to_owned()
+        mut out = sb.to_owned()
+        sb.free()
+        return out
 
     pub def to_lower(s: str) -> str:
         mut slen = Str.len(s)
@@ -207,7 +217,9 @@ extend Str:
             if ch >= 65 and ch <= 90: ch = ch + 32
             sb.append_char(ch)
             i = i + 1
-        return sb.to_owned()
+        mut out = sb.to_owned()
+        sb.free()
+        return out
 
     # Capitalize: first letter upper, rest lower.
     pub def capitalize(s: str) -> str:
@@ -216,7 +228,9 @@ extend Str:
         mut p  = low as Pointer[char]
         mut ch = p.offset(0).read() as int
         if ch >= 97 and ch <= 122:
-            return Str.to_upper(Str.slice(low, 0, 1)) + Str.slice(low, 1, Str.len(low))
+            mut result = Str.to_upper(Str.slice(low, 0, 1)) + Str.slice(low, 1, Str.len(low))
+            unsafe: _tr_c_free(low as Pointer[char])
+            return result
         return low
 
     # Title-case: capitalize each word.
@@ -236,7 +250,9 @@ extend Str:
                 sb.append_char(ch)
             prev = ch
             i = i + 1
-        return sb.to_owned()
+        mut out = sb.to_owned()
+        sb.free()
+        return out
 
     # ── Trimming ─────────────────────────────────────────────────────────────
 
@@ -280,7 +296,9 @@ extend Str:
             sb.append_char(pad_char)
             i = i + 1
         sb.append(s)
-        return sb.to_owned()
+        mut out = sb.to_owned()
+        sb.free()
+        return out
 
     # Right-pad s to width using pad_char.
     pub def rpad(s: str, width: int, pad_char: int) -> str:
@@ -292,7 +310,9 @@ extend Str:
         while i < width:
             sb.append_char(pad_char)
             i = i + 1
-        return sb.to_owned()
+        mut out = sb.to_owned()
+        sb.free()
+        return out
 
     # Center s within width, padding with spaces.
     pub def center(s: str, width: int) -> str:
@@ -311,7 +331,9 @@ extend Str:
         while i < right:
             sb.append_char(32)
             i = i + 1
-        return sb.to_owned()
+        mut out = sb.to_owned()
+        sb.free()
+        return out
 
     # ── Search ───────────────────────────────────────────────────────────────
 
@@ -360,10 +382,13 @@ extend Str:
     pub def count(s: str, sub: str) -> int:
         mut subl = Str.len(sub)
         if subl == 0: return 0
+        mut sl = Str.len(s)
         mut n = 0
         mut i = 0
         while True:
-            mut pos = Str.index_of(Str.slice(s, i, Str.len(s)), sub)
+            mut rest = Str.slice(s, i, sl)
+            mut pos = Str.index_of(rest, sub)
+            unsafe: _tr_c_free(rest as Pointer[char])
             if pos < 0: break
             n = n + 1
             i = i + pos + subl
@@ -405,7 +430,7 @@ extend Str:
         return out
 
     pub def join(parts: List[str], sep: str) -> str:
-        return _tr_str_join(parts, sep)
+        return _tr_strx_join_trstr(parts, sep)
 
     pub def replace(s: str, old: str, new_: str) -> str:
         mut result = StringBuilder.init(Str.len(s) + 1)
@@ -430,24 +455,41 @@ extend Str:
             else:
                 result.append_char(sp.offset(i).read() as int)
                 i = i + 1
-        return result.to_owned()
+        mut out = result.to_owned()
+        result.free()
+        return out
 
     # Replace only the first occurrence of old.
     pub def replace_first(s: str, old: str, new_: str) -> str:
         mut pos = Str.index_of(s, old)
         if pos < 0: return s
         mut sb = StringBuilder.init(Str.len(s) + Str.len(new_))
-        sb.append(Str.slice(s, 0, pos))
+        mut sl = Str.len(s)
+        mut tail_start = pos + Str.len(old)
+        mut head = Str.slice(s, 0, pos)
+        mut tail = Str.slice(s, tail_start, sl)
+        sb.append(head)
         sb.append(new_)
-        sb.append(Str.slice(s, pos + Str.len(old), Str.len(s)))
-        return sb.to_owned()
+        sb.append(tail)
+        unsafe:
+            if pos > 0: _tr_c_free(head as Pointer[char])
+            if tail_start < sl: _tr_c_free(tail as Pointer[char])
+        mut out = sb.to_owned()
+        sb.free()
+        return out
 
     # Simple positional format: replaces each "{}" in template with the next value.
     pub def format(template: str, values: Vec[str]) -> str:
         mut result = template
+        mut owned  = false
         mut i      = 0
         while i < values.len:
-            result = Str.replace_first(result, "{}", values.get(i))
+            if Str.index_of(result, "{}") >= 0:
+                mut next = Str.replace_first(result, "{}", values.get(i))
+                if owned: unsafe: _tr_c_free(result as Pointer[char])
+                result = next
+                unsafe: _tr_c_free(next as Pointer[char])
+                owned  = true
             i = i + 1
         return result
 
@@ -574,4 +616,75 @@ extend Str:
             mut ch = p.offset(i).read() as int
             if ch != c: sb.append_char(ch)
             i = i + 1
-        return sb.to_owned()
+        mut out = sb.to_owned()
+        sb.free()
+        return out
+
+# ── StrView: a ZERO-COPY substring view (Gap 1) ──────────────────────────────
+# A StrView holds a BORROWED pointer into a source string plus a length — it does
+# NOT own or copy the bytes. Creating/slicing a view is allocation-free; only
+# `.to_str()` materializes an owned copy. The view is valid only while its source
+# string is alive (the borrow checker can enforce this for `from`-region views).
+@value_type
+pub class StrView:
+    pub data: Pointer[char]   # borrowed — points into the source's buffer
+    pub len:  int
+
+extend StrView:
+    # Zero-copy view of `s[start : start+count]`. No allocation.
+    pub def of(s: str, start: int, count: int) -> StrView:
+        mut v = StrView()
+        mut p = s as Pointer[char]
+        v.data = p.offset(start)
+        v.len  = count
+        return v
+
+    # Zero-copy view of the whole string.
+    pub def all(s: str) -> StrView:
+        mut v = StrView()
+        v.data = s as Pointer[char]
+        v.len  = Str.len(s)
+        return v
+
+    pub def length(self) -> int:
+        return self.len
+
+    pub def char_at(self, i: int) -> char:
+        return self.data.offset(i).read()
+
+    # Zero-copy sub-view of this view.
+    pub def slice(self, start: int, count: int) -> StrView:
+        mut v = StrView()
+        v.data = self.data.offset(start)
+        v.len  = count
+        return v
+
+    # Materialize into an OWNED `str` (this is the one operation that allocates).
+    pub def to_str(self) -> str:
+        return _tr_str_slice(self.data, 0, self.len)
+
+    # Byte-wise equality with an owned str — no allocation.
+    pub def eq(self, other: str) -> bool:
+        if self.len != Str.len(other): return false
+        mut op = other as Pointer[char]
+        mut i  = 0
+        while i < self.len:
+            if self.data.offset(i).read() as int != op.offset(i).read() as int: return false
+            i = i + 1
+        return true
+
+    pub def starts_with(self, prefix: str) -> bool:
+        mut pl = Str.len(prefix)
+        if pl > self.len: return false
+        mut pp = prefix as Pointer[char]
+        mut i  = 0
+        while i < pl:
+            if self.data.offset(i).read() as int != pp.offset(i).read() as int: return false
+            i = i + 1
+        return true
+
+# Borrow-checked zero-copy view constructor (Gap 3): the returned StrView BORROWS its
+# source `s` — under --strict the borrow checker enforces that `s` is not mutated/moved
+# while the view is still live (so the view can never dangle).
+pub def str_view(s: str, start: int, count: int) -> StrView from s:
+    return StrView.of(s, start, count)

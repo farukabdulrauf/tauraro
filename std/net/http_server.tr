@@ -31,10 +31,40 @@
 
 from std.core.string import StringBuilder
 from std.net.tcp import TcpStream, TcpListener
+from std.net.url import Url
 from std.string.str import Str
 from std.string.fmt import Fmt
 from std.core.map import Map
 from std.core.vec import Vec
+
+extern "C":
+    def _tr_time_ms() -> int
+    def _tr_c_free(ptr: Pointer[char])
+
+# Lowercase a single ASCII byte ('A'..'Z' -> 'a'..'z'); other bytes unchanged.
+# Used for case-insensitive header-name matching without allocating a lowercased
+# copy of the name or the header line.
+pub def _ascii_lower(c: int) -> int:
+    if c >= 65 and c <= 90: return c + 32
+    return c
+
+# Full HTTP status line (incl. trailing CRLF) for common codes, as a single
+# string literal -> zero allocation. Returns "" for uncommon codes so the caller
+# builds it dynamically. Lets the hot response path skip Fmt.int_to_str + the
+# reason-phrase lookup that HttpResponse.to_wire does.
+pub def _status_line_lit(status: int) -> str:
+    if status == 200: return "HTTP/1.1 200 OK\r\n"
+    if status == 201: return "HTTP/1.1 201 Created\r\n"
+    if status == 204: return "HTTP/1.1 204 No Content\r\n"
+    if status == 304: return "HTTP/1.1 304 Not Modified\r\n"
+    if status == 400: return "HTTP/1.1 400 Bad Request\r\n"
+    if status == 401: return "HTTP/1.1 401 Unauthorized\r\n"
+    if status == 403: return "HTTP/1.1 403 Forbidden\r\n"
+    if status == 404: return "HTTP/1.1 404 Not Found\r\n"
+    if status == 413: return "HTTP/1.1 413 Payload Too Large\r\n"
+    if status == 429: return "HTTP/1.1 429 Too Many Requests\r\n"
+    if status == 500: return "HTTP/1.1 500 Internal Server Error\r\n"
+    return ""
 
 # ── HttpRequest ───────────────────────────────────────────────────────────────
 
@@ -43,10 +73,15 @@ pub class HttpRequest:
     pub path:     str       # "/users/42"
     pub query:    str       # raw query string without '?'
     pub body:     str       # request body
-    pub headers:  Map[str]  # request headers
-    pub params:   Map[str]  # path parameters extracted by router (:id → "42")
+    pub headers:  Map[str, str]  # request headers (lazily populated; see _raw_hdr / headers_map())
+    pub params:   Map[str, str]  # path parameters extracted by router (:id → "42")
     pub route_id: int       # matched route identifier (-1 if unmatched)
     pub version:  str       # "HTTP/1.1" or "HTTP/1.0"
+    pub version_owned: bool # true when `version` is a heap Str.slice (HttpParser.parse set it), not the init() literal
+    pub recv_ms:  int       # Clock.now_ms() when this request was parsed (for timing middleware)
+    pub oversized: bool     # true when the declared Content-Length exceeded the server's body limit (handler should 413)
+    pub _raw_hdr: str       # owned slice of the raw header block (lines after the request line); scanned on demand by header()
+    pub _ka:      int        # keep-alive cache: -1 = not yet computed, 0 = false, 1 = true
 
 extend HttpRequest:
     pub def init() -> HttpRequest:
@@ -55,39 +90,94 @@ extend HttpRequest:
         r.path       = "/"
         r.query      = ""
         r.body       = ""
-        r.headers    = Map[str].init(16)
-        r.params     = Map[str].init(4)
+        # Headers are parsed lazily (scanned out of _raw_hdr by header()), so the
+        # map starts empty and small - most handlers read 0-2 headers, so building
+        # a full Map of every header on every request is pure overhead. headers_map()
+        # populates it on demand for the rare caller that wants the whole map.
+        r.headers    = Map[str, str].init(4)
+        r.params     = Map[str, str].init(4)
         r.route_id   = -1
         r.version    = "HTTP/1.1"
+        r.version_owned = false
+        r.recv_ms    = _tr_time_ms()
+        r.oversized  = false
+        r._raw_hdr   = ""
+        r._ka        = -1
         return r
 
-    # Return a header value by name, or "" when absent.
+    # Return a header value by name (case-insensitive), or "" when absent.
+    # HTTP header names are case-insensitive; the parser stores them lowercased.
+    # Look up a request header by name (case-insensitive), or "" when absent.
+    # Scans the raw header block in place (no per-request header Map is built):
+    # the only allocation is the returned value slice when the header is found.
     pub def header(self, name: str) -> str:
-        if self.headers.contains(name): return self.headers.get(name)
+        mut raw  = self._raw_hdr
+        mut rlen = Str.len(raw)
+        mut nlen = Str.len(name)
+        if rlen == 0 or nlen == 0: return ""
+        mut pos = 0
+        while pos < rlen:
+            # Try to match `name:` (case-insensitive) at the start of this line.
+            mut matched = pos + nlen < rlen
+            mut k = 0
+            while matched and k < nlen:
+                if _ascii_lower(Str.char_at(raw, pos + k)) != _ascii_lower(Str.char_at(name, k)):
+                    matched = false
+                k = k + 1
+            if matched and Str.char_at(raw, pos + nlen) == 58:   # ':' immediately after the name
+                mut vs = pos + nlen + 1
+                while vs < rlen and Str.char_at(raw, vs) == 32: vs = vs + 1   # skip OWS
+                mut ve = vs
+                while ve < rlen and Str.char_at(raw, ve) != 13: ve = ve + 1   # up to CR
+                return Str.slice(raw, vs, ve)
+            # Advance to the start of the next line (past the next LF).
+            while pos < rlen and Str.char_at(raw, pos) != 10: pos = pos + 1
+            pos = pos + 1
         return ""
+
+    # Populate and return the full header Map (name -> value, names lowercased).
+    # Lazy: built once on first call from _raw_hdr, for callers that need to
+    # iterate every header. The hot path uses header() and never calls this.
+    pub def headers_map(self) -> Map[str, str]:
+        if self.headers.len() > 0 or Str.len(self._raw_hdr) == 0:
+            return self.headers
+        HttpParser._parse_headers_into(self._raw_hdr, self.headers)
+        return self.headers
 
     # Return a path parameter by name (set by router), or "" when absent.
     pub def get_param(self, name: str) -> str:
         if self.params.contains(name): return self.params.get(name)
         return ""
 
-    # Return the first value of a query parameter (simple key=value parsing).
-    pub def query_param(self, key: str) -> str:
-        mut ql  = Str.len(self.query)
-        if ql == 0: return ""
-        mut pos = 0
-        while pos < ql:
-            mut amp  = Str.index_of(Str.slice(self.query, pos, ql), "&")
-            mut end_ = ql
-            if amp >= 0: end_ = pos + amp
-            mut pair = Str.slice(self.query, pos, end_)
+    # Parse an application/x-www-form-urlencoded blob (key=val&key=val), returning
+    # the percent-decoded value for `key` ('+' decodes to space), or "" if absent.
+    def _kv_lookup(data: str, key: str) -> str:
+        if Str.len(data) == 0: return ""
+        mut pairs = Str.split_to_vec(data, "&")
+        mut i = 0
+        while i < pairs.len:
+            mut pair = pairs.get(i)
             mut eq   = Str.index_of(pair, "=")
             if eq >= 0:
                 mut k = Str.slice(pair, 0, eq)
                 if Str.eq(k, key):
-                    return Str.slice(pair, eq + 1, Str.len(pair))
-            pos = end_ + 1
+                    mut v = Str.slice(pair, eq + 1, Str.len(pair))
+                    mut decoded = Url.decode_component(Str.replace(v, "+", " "))
+                    return decoded
+            i = i + 1
         return ""
+
+    # First value of a query-string parameter, percent-decoded.
+    pub def query_param(self, key: str) -> str:
+        return HttpRequest._kv_lookup(self.query, key)
+
+    # First value of an application/x-www-form-urlencoded body field, decoded.
+    pub def form_param(self, key: str) -> str:
+        return HttpRequest._kv_lookup(self.body, key)
+
+    # True when the body is a URL-encoded form.
+    pub def is_form(self) -> bool:
+        return Str.contains(HttpRequest.header(self, "content-type"), "application/x-www-form-urlencoded")
 
     # Content-Type header value, or "" when absent.
     pub def content_type(self) -> str:
@@ -109,22 +199,115 @@ extend HttpRequest:
     pub def cookies(self) -> str:
         return HttpRequest.header(self, "Cookie")
 
+    # Whether the connection this request arrived on should remain open for
+    # another request after the response is sent: HTTP/1.1 defaults to
+    # keep-alive (unless `Connection: close` is sent), HTTP/1.0 defaults to
+    # close (unless `Connection: keep-alive` is sent).
+    # Whether this connection should be kept alive after the response. Computed
+    # once and cached on `_ka` - keep_alive() is consulted both per-request in
+    # the serve loop and again when writing each response, so caching avoids
+    # re-scanning + re-lowercasing the Connection header twice per request.
+    pub def keep_alive(self) -> bool:
+        if self._ka >= 0: return self._ka == 1
+        mut conn_hdr = Str.to_lower(HttpRequest.header(self, "Connection"))
+        mut has_close = Str.contains(conn_hdr, "close")
+        mut has_keepalive = Str.contains(conn_hdr, "keep-alive")
+        unsafe: _tr_c_free(conn_hdr as Pointer[char])
+        mut result = Str.eq(self.version, "HTTP/1.1")
+        if has_close: result = false
+        elif has_keepalive: result = true
+        if result: self._ka = 1
+        else: self._ka = 0
+        return result
+
+    # Free this request's headers/params maps (incl. values - every value is
+    # a heap-allocated Str.slice/Str.to_lower result, parser-owned, never a
+    # string literal), the method/path/query/body/version fields (each
+    # `_tr_c_free(x as Pointer[char])` is rewritten by c.tr to
+    # `_tr_str_release(x)`, which is a no-op for string-literal defaults from
+    # init() and releases both .data and .rc for heap Str.slice results), and
+    # finally this HttpRequest struct itself.
+    pub def free_owned(self):
+        # Map[str,str].free() (Dict_free_strval, #54) releases each boxed
+        # TrStr value and frees its box, in addition to the usual
+        # buckets/nodes/key-strings/struct - no separate values() loop needed.
+        self.headers.free()
+        self.params.free()
+        unsafe:
+            _tr_c_free(self.method as Pointer[char])
+            _tr_c_free(self.path as Pointer[char])
+            _tr_c_free(self.query as Pointer[char])
+            _tr_c_free(self.body as Pointer[char])
+            _tr_c_free(self.version as Pointer[char])
+            _tr_c_free(self._raw_hdr as Pointer[char])
+        unsafe: _tr_c_free(self as Pointer[char])
+
+    # Reset this request so it can be reused for the NEXT keep-alive request on
+    # the same connection, WITHOUT freeing the struct or the headers/params map
+    # structs (those are reused). Releases the owned per-request slices, then
+    # restores init() defaults. The maps are reused as-is when already empty (the
+    # common case - no boxed values to release); only when one actually holds
+    # entries (e.g. params after a matched ':id' route) is it freed + re-created,
+    # which correctly releases its boxed str values via Map.free()'s _strval path.
+    pub def _reset_for_reuse(self):
+        unsafe:
+            _tr_c_free(self.method as Pointer[char])
+            _tr_c_free(self.path as Pointer[char])
+            _tr_c_free(self.query as Pointer[char])
+            _tr_c_free(self.body as Pointer[char])
+            _tr_c_free(self.version as Pointer[char])
+            _tr_c_free(self._raw_hdr as Pointer[char])
+        if self.headers.len() > 0:
+            self.headers.free()
+            self.headers = Map[str, str].init(4)
+        if self.params.len() > 0:
+            self.params.free()
+            self.params = Map[str, str].init(4)
+        self.method        = ""
+        self.path          = "/"
+        self.query         = ""
+        self.body          = ""
+        self.version       = "HTTP/1.1"
+        self.version_owned = false
+        self.route_id      = -1
+        self.recv_ms       = _tr_time_ms()
+        self.oversized     = false
+        self._raw_hdr      = ""
+        self._ka           = -1
+
 # ── HttpResponse ──────────────────────────────────────────────────────────────
 
 pub class HttpResponse:
     pub status:  int
     pub body:    str
-    pub headers: Map[str]
+    pub headers: Map[str, str]   # name -> value (last write wins)
+    pub _order:  Vec[str]        # header names in insertion order (for deterministic wire output)
 
 extend HttpResponse:
     pub def init(status: int, body: str) -> HttpResponse:
         mut r    = HttpResponse()
         r.status = status
         r.body   = body
-        r.headers = Map[str].init(8)
+        r.headers = Map[str, str].init(8)
+        r._order  = Vec[str].init(8)
         return r
 
+    # Free this response's own heap allocation, once its headers/_order and
+    # body have already been dealt with by the caller. Named `dispose`, not
+    # `free`, so HttpResponse stays out of auto-drop - callers build it with
+    # `mut resp = HttpResponse.init(...)` and pass it into send_response,
+    # which is the sole owner that calls this.
+    pub def dispose(self):
+        # Release the body string we retained in init (field-store retains the
+        # str). Without this the response body leaks one ref per request. The
+        # codegen rewrites `_tr_c_free(str as Pointer[char])` to the correct
+        # refcounted `_tr_str_release`. Balanced: init did +1, dispose does -1.
+        unsafe: _tr_c_free(self.body as Pointer[char])
+        unsafe: _tr_c_free(self as Pointer[char])
+
     pub def set_header(self, name: str, value: str):
+        if not self.headers.contains(name):
+            self._order.push(name)
         self.headers.insert(name, value)
 
     pub def is_ok(self) -> bool:
@@ -139,7 +322,9 @@ extend HttpResponse:
     pub def to_wire(self) -> str:
         mut sb = StringBuilder.init(256)
         sb.append("HTTP/1.1 ")
-        sb.append(Fmt.int_to_str(self.status))
+        mut status_s = Fmt.int_to_str(self.status)
+        sb.append(status_s)
+        unsafe: _tr_c_free(status_s as Pointer[char])
         sb.append(" ")
         if self.status == 200:      sb.append("OK")
         elif self.status == 201:    sb.append("Created")
@@ -153,18 +338,40 @@ extend HttpResponse:
         elif self.status == 404:    sb.append("Not Found")
         elif self.status == 405:    sb.append("Method Not Allowed")
         elif self.status == 409:    sb.append("Conflict")
+        elif self.status == 413:    sb.append("Payload Too Large")
         elif self.status == 422:    sb.append("Unprocessable Entity")
         elif self.status == 429:    sb.append("Too Many Requests")
         elif self.status == 500:    sb.append("Internal Server Error")
         elif self.status == 502:    sb.append("Bad Gateway")
         elif self.status == 503:    sb.append("Service Unavailable")
         else:                       sb.append("Unknown")
-        sb.append("\r\nContent-Length: ")
-        sb.append(Fmt.int_to_str(Str.len(self.body)))
         sb.append("\r\n")
-        sb.append("\r\n")
+        # Emit all user-set headers (Content-Type, Location, Set-Cookie, ...).
+        # Skip Content-Length here; it is always computed below from the body.
+        mut hi = 0
+        while hi < self._order.len:
+            mut hk = self._order.get(hi)
+            mut hk_lower = Str.to_lower(hk)
+            if not Str.eq(hk_lower, "content-length"):
+                sb.append(hk)
+                sb.append(": ")
+                sb.append(self.headers.get(hk))
+                sb.append("\r\n")
+            unsafe: _tr_c_free(hk_lower as Pointer[char])
+            hi = hi + 1
+        sb.append("Content-Length: ")
+        mut body_len = Str.len(self.body)
+        if body_len == 0:
+            sb.append("0")
+        else:
+            mut clen_s = Fmt.int_to_str(body_len)
+            sb.append(clen_s)
+            unsafe: _tr_c_free(clen_s as Pointer[char])
+        sb.append("\r\n\r\n")
         sb.append(self.body)
-        return sb.to_owned()
+        mut wire = sb.to_owned()
+        sb.free()
+        return wire
 
 # ── HttpConn ──────────────────────────────────────────────────────────────────
 
@@ -172,6 +379,9 @@ pub class HttpConn:
     pub request: HttpRequest
     pub _stream: TcpStream
     pub _closed: bool
+    pub _headers: Map[str, str]   # response headers to merge into every send (cookies, etc.)
+    pub _horder:  Vec[str]        # names in insertion order (avoids generic Map.keys())
+    pub last_status: int          # status code of the most recent send_response (0 = none yet)
 
 extend HttpConn:
     pub def init(req: HttpRequest, stream: TcpStream) -> HttpConn:
@@ -179,34 +389,171 @@ extend HttpConn:
         c.request  = req
         c._stream  = stream
         c._closed  = false
+        c._headers = Map[str, str].init(8)
+        c._horder  = Vec[str].init(8)
+        c.last_status = 0
         return c
 
-    # Send a pre-built HttpResponse.
+    # Queue a response header applied to the next send (chainable-friendly).
+    pub def set_resp_header(self, name: str, value: str):
+        if not self._headers.contains(name):
+            self._horder.push(name)
+        self._headers.insert(name, value)
+
+    # Send a pre-built HttpResponse, merging any conn-level response headers.
     pub def send_response(self, resp: HttpResponse):
         if not self._closed:
-            self._stream.send(resp.to_wire())
+            mut i = 0
+            while i < self._horder.len:
+                mut k = self._horder.get(i)
+                resp.set_header(k, self._headers.get(k))
+                i = i + 1
+            if not resp.headers.contains("Connection"):
+                if self.request.keep_alive():
+                    resp.set_header("Connection", "keep-alive")
+                else:
+                    resp.set_header("Connection", "close")
+            self.last_status = resp.status
+            mut wire = resp.to_wire()
+            mut sent = self._stream.send(wire)
+            unsafe: _tr_c_free(wire as Pointer[char])
+            resp.headers.free()
+            resp._order.free()
+            resp.dispose()
+
+    # Fast path for a simple response (a single Content-Type, a body). Builds the
+    # whole wire in ONE StringBuilder and sends it with a single write, skipping
+    # the HttpResponse + headers-Map + _order-Vec machinery that send_response
+    # builds and tears down (~12 allocations per request). `body` is only
+    # appended (copied), never owned, so the caller keeps responsibility for it
+    # exactly as with the old HttpResponse path.
+    #
+    # Falls back to the full path when the connection has queued custom headers
+    # (set_resp_header), which must be merged into the response.
+    pub def _send_simple(self, status: int, content_type: str, body: str):
+        if self._closed: return
+        if self._horder.len > 0:
+            mut resp = HttpResponse.init(status, body)
+            resp.set_header("Content-Type", content_type)
+            HttpConn.send_response(self, resp)
+            return
+        mut sb   = StringBuilder.init(160 + Str.len(body))
+        mut line = _status_line_lit(status)
+        if Str.len(line) > 0:
+            sb.append(line)
+        else:
+            sb.append("HTTP/1.1 ")
+            sb.append_int(status)       # format directly into the buffer — no
+            sb.append(" OK\r\n")        # intermediate heap string + free per req
+        sb.append("Content-Type: ")
+        sb.append(content_type)
+        sb.append("\r\nContent-Length: ")
+        sb.append_int(Str.len(body))    # ditto — was Fmt.int_to_str()+_tr_c_free()
+        if self.request.keep_alive():
+            sb.append("\r\nConnection: keep-alive\r\n\r\n")
+        else:
+            sb.append("\r\nConnection: close\r\n\r\n")
+        sb.append(body)
+        # Send the StringBuilder's buffer DIRECTLY (send_raw takes ptr+len, is
+        # cooperative-blocking so `sb` stays valid until all bytes are written,
+        # and is TLS-aware). This avoids to_owned()'s full-response memcpy +
+        # allocation + free, and send()'s NUL-length rescan — a measurable win
+        # on the large-body paths (plaintext-big, fortunes).
+        mut sent = self._stream.send_raw(sb.buf.data, sb.buf.len)
+        sb.free()
+        self.last_status = status
 
     # Convenience: plain-text response.
     pub def send_text(self, status: int, text: str):
-        mut resp = HttpResponse.init(status, text)
-        resp.set_header("Content-Type", "text/plain; charset=utf-8")
-        HttpConn.send_response(self, resp)
+        HttpConn._send_simple(self, status, "text/plain; charset=utf-8", text)
 
     # Convenience: JSON response.
     pub def send_json(self, status: int, json: str):
-        mut resp = HttpResponse.init(status, json)
-        resp.set_header("Content-Type", "application/json")
-        HttpConn.send_response(self, resp)
+        HttpConn._send_simple(self, status, "application/json", json)
 
     # Convenience: HTML response.
     pub def send_html(self, status: int, html: str):
-        mut resp = HttpResponse.init(status, html)
-        resp.set_header("Content-Type", "text/html; charset=utf-8")
-        HttpConn.send_response(self, resp)
+        HttpConn._send_simple(self, status, "text/html; charset=utf-8", html)
 
     # Convenience: status-only response with empty body.
     pub def send_status(self, status: int):
         HttpConn.send_text(self, status, "")
+
+    # ── Streaming responses (HTTP/1.1 chunked transfer-encoding) ──────────────
+    # For responses whose length isn't known up front, or that are produced
+    # incrementally (large files, live feeds): begin_chunked() sends the status
+    # line + headers, write_chunk() emits each piece, end_chunked() terminates.
+    # The body is never buffered whole in memory. The connection stays usable
+    # for keep-alive afterwards (chunked encoding is self-delimiting).
+    #
+    #   c.begin_chunked(200, "text/plain")
+    #   while more: c.write_chunk(next_piece())
+    #   c.end_chunked()
+    pub def begin_chunked(self, status: int, content_type: str):
+        if self._closed: return
+        mut sb = StringBuilder.init(128)
+        sb.append("HTTP/1.1 ")
+        mut ss = Fmt.int_to_str(status)
+        sb.append(ss)
+        unsafe: _tr_c_free(ss as Pointer[char])
+        sb.append(" OK\r\nContent-Type: ")
+        sb.append(content_type)
+        sb.append("\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n")
+        mut wire = sb.to_owned()
+        sb.free()
+        self._stream.send(wire)
+        unsafe: _tr_c_free(wire as Pointer[char])
+        self.last_status = status
+
+    # Emit one chunk of a chunked response. Empty data is ignored (a 0-length
+    # chunk would prematurely terminate the response - use end_chunked()).
+    pub def write_chunk(self, data: str):
+        if self._closed: return
+        mut n = Str.len(data)
+        if n == 0: return
+        mut sb = StringBuilder.init(n + 16)
+        mut hx = Fmt.int_to_hex(n)
+        sb.append(hx)
+        unsafe: _tr_c_free(hx as Pointer[char])
+        sb.append("\r\n")
+        sb.append(data)
+        sb.append("\r\n")
+        mut wire = sb.to_owned()
+        sb.free()
+        self._stream.send(wire)
+        unsafe: _tr_c_free(wire as Pointer[char])
+
+    # Terminate a chunked response (the final zero-length chunk).
+    pub def end_chunked(self):
+        if self._closed: return
+        self._stream.send("0\r\n\r\n")
+
+    # ── Server-Sent Events (text/event-stream over chunked) ───────────────────
+    # begin_sse() opens an event stream; send_event() pushes one `data:` event.
+    # The handler typically loops sending events until the client disconnects
+    # (a send returning <= 0). Built on chunked encoding so it works over the
+    # existing keep-alive connection.
+    #
+    #   c.begin_sse()
+    #   c.send_event("hello")
+    #   c.send_event("{\"tick\":1}")
+    pub def begin_sse(self):
+        if self._closed: return
+        mut hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+        self._stream.send(hdr)
+        self.last_status = 200
+
+    # Push a single SSE event carrying `data` (sent as one chunk: "data: ...\n\n").
+    pub def send_event(self, data: str):
+        if self._closed: return
+        mut sb = StringBuilder.init(Str.len(data) + 8)
+        sb.append("data: ")
+        sb.append(data)
+        sb.append("\n\n")
+        mut ev = sb.to_owned()
+        sb.free()
+        HttpConn.write_chunk(self, ev)
+        unsafe: _tr_c_free(ev as Pointer[char])
 
     # Redirect to another URL.
     pub def redirect(self, url: str, permanent: bool):
@@ -225,13 +572,50 @@ extend HttpConn:
         sb.append("; Path=")
         sb.append(path)
         if http_only: sb.append("; HttpOnly")
-        self.request.headers.insert("Set-Cookie", sb.to_owned())
+        mut cookie = sb.to_owned()
+        sb.free()
+        HttpConn.set_resp_header(self, "Set-Cookie", cookie)
 
     # Close the underlying TCP connection.
     pub def close(self):
         if not self._closed:
             self._stream.close()
             self._closed = true
+            self.request.free_owned()
+            self._headers.free()
+            self._horder.free()
+
+    # Reset this connection's per-request state to serve another request
+    # (HTTP/1.1 keep-alive) on the same underlying TCP stream.
+    pub def reset_for(self, req: HttpRequest):
+        self.request = req
+        self._headers.free()
+        self._horder.free()
+        self._headers = Map[str, str].init(8)
+        self._horder  = Vec[str].init(8)
+        self.last_status = 0
+
+    # Reset only the per-response conn state (queued response headers + status)
+    # between keep-alive requests, leaving `request` in place for in-place reuse
+    # (read_next_into). The header map/vec are reused as-is when empty (the common
+    # case) and only freed + re-created when a handler actually queued headers.
+    pub def _reset_for_next(self):
+        if self._horder.len > 0:
+            self._headers.free()
+            self._horder.free()
+            self._headers = Map[str, str].init(8)
+            self._horder  = Vec[str].init(8)
+        self.last_status = 0
+
+    # Release the HttpConn heap instance itself (and any per-request state
+    # not already released by close()) once the connection is torn down.
+    pub def dispose(self):
+        if not self._closed:
+            self.request.free_owned()
+            self._headers.free()
+            self._horder.free()
+            self._closed = true
+        unsafe: _tr_c_free(self as Pointer[char])
 
 # ── HttpRoute ─────────────────────────────────────────────────────────────────
 
@@ -302,18 +686,50 @@ extend HttpRouter:
     def _match_path(self, pattern: str, req: HttpRequest) -> bool:
         mut pp   = Str.split_to_vec(pattern, "/")
         mut rp   = Str.split_to_vec(req.path, "/")
-        if pp.len != rp.len: return false
-        mut i    = 0
-        while i < pp.len:
-            mut ps = pp.get(i)
-            mut rs = rp.get(i)
-            if Str.len(ps) > 0 and Str.char_at(ps, 0) == 58:
-                mut pname = Str.slice(ps, 1, Str.len(ps))
-                req.params.insert(pname, rs)
-            elif not Str.eq(ps, rs):
-                return false
-            i = i + 1
-        return true
+        mut result = true
+        mut break_i = -1
+        if pp.len != rp.len:
+            result = false
+        else:
+            mut i = 0
+            while i < pp.len:
+                mut ps = pp.get(i)
+                mut rs = rp.get(i)
+                mut is_param = Str.len(ps) > 0 and Str.char_at(ps, 0) == 58
+                mut eq = false
+                if not is_param: eq = Str.eq(ps, rs)
+                if is_param:
+                    mut pname = Str.slice(ps, 1, Str.len(ps))
+                    req.params.insert(pname, rs)
+                    # insert() strdup's pname as the key and stores rs as-is
+                    # (rs is now owned by req.params - do not free it here).
+                    unsafe:
+                        _tr_c_free(pname as Pointer[char])
+                        _tr_c_free(ps as Pointer[char])
+                else:
+                    unsafe:
+                        _tr_c_free(ps as Pointer[char])
+                        _tr_c_free(rs as Pointer[char])
+                    if not eq:
+                        result = false
+                        break_i = i
+                        break
+                i = i + 1
+        # Free any segments past the mismatch point (or all of them, if the
+        # segment counts differed) that the loop above never got to.
+        if not result:
+            mut start = break_i + 1
+            mut fi = start
+            while fi < pp.len:
+                unsafe: _tr_c_free(pp.get(fi) as Pointer[char])
+                fi = fi + 1
+            fi = start
+            while fi < rp.len:
+                unsafe: _tr_c_free(rp.get(fi) as Pointer[char])
+                fi = fi + 1
+        pp.free()
+        rp.free()
+        return result
 
 # ── Request parsing ───────────────────────────────────────────────────────────
 
@@ -321,10 +737,22 @@ pub class HttpParser:
     _dummy: int
 
 extend HttpParser:
-    # Parse a raw HTTP request string into an HttpRequest.
+    # Parse a raw HTTP request string into a fresh HttpRequest.
     pub def parse(raw: str) -> HttpRequest:
         mut req = HttpRequest.init()
-        if Str.len(raw) == 0: return req
+        HttpParser._fill(req, raw)
+        return req
+
+    # Reset an EXISTING request and parse `raw` into it. Used by the keep-alive
+    # serve loop to reuse one HttpRequest (and its headers/params map structs)
+    # across every request on a connection instead of free+alloc per request.
+    pub def parse_into(req: HttpRequest, raw: str):
+        HttpRequest._reset_for_reuse(req)
+        HttpParser._fill(req, raw)
+
+    # Populate an already-init'd (or just-reset) `req` from a raw request string.
+    def _fill(req: HttpRequest, raw: str):
+        if Str.len(raw) == 0: return
         mut header_end = Str.index_of(raw, "\r\n\r\n")
         mut body_start = 0
         if header_end >= 0:
@@ -332,45 +760,106 @@ extend HttpParser:
             req.body    = Str.slice(raw, body_start, Str.len(raw))
         else:
             header_end  = Str.len(raw)
-        mut hdr_sec     = Str.slice(raw, 0, header_end)
-        mut first_line  = Str.index_of(hdr_sec, "\r\n")
-        mut request_ln  = hdr_sec
-        mut rest_hdrs   = ""
-        if first_line >= 0:
-            request_ln  = Str.slice(hdr_sec, 0, first_line)
-            rest_hdrs   = Str.slice(hdr_sec, first_line + 2, Str.len(hdr_sec))
-        mut sp1 = Str.index_of(request_ln, " ")
-        if sp1 >= 0:
-            req.method  = Str.slice(request_ln, 0, sp1)
-            mut after   = Str.slice(request_ln, sp1 + 1, Str.len(request_ln))
-            mut sp2     = Str.index_of(after, " ")
-            mut full_path = after
-            if sp2 >= 0:
-                full_path     = Str.slice(after, 0, sp2)
-                req.version   = Str.slice(after, sp2 + 1, Str.len(after))
-            mut q = Str.index_of(full_path, "?")
-            if q >= 0:
-                req.path  = Str.slice(full_path, 0, q)
-                req.query = Str.slice(full_path, q + 1, Str.len(full_path))
+        # Parse the request line positionally from `raw` directly. The old design
+        # sliced hdr_sec / request_ln / after / full_path — ~4 fresh heap slices
+        # allocated + freed PER REQUEST just to locate the two spaces and the '?'.
+        # We scan for those byte offsets in-place and slice ONLY the fields we keep
+        # (method/path/query/version/_raw_hdr). Each kept field is a fresh inline
+        # Str.slice (rc=1, sole owner, freed by free_owned) — never a borrowed local
+        # assigned into a field (#53), same ownership as req.path's branch.
+        mut line_end = Str.index_of(raw, "\r\n")   # end of the request line
+        if line_end < 0 or line_end > header_end: line_end = header_end
+        mut sp1 = -1
+        mut ci = 0
+        while ci < line_end:
+            if Str.char_at(raw, ci) == 32:    # ' ' after METHOD
+                sp1 = ci
+                ci = line_end
             else:
-                req.path  = full_path
+                ci = ci + 1
+        if sp1 >= 0:
+            req.method = Str.slice(raw, 0, sp1)
+            mut sp2 = -1
+            ci = sp1 + 1
+            while ci < line_end:
+                if Str.char_at(raw, ci) == 32:    # ' ' before VERSION
+                    sp2 = ci
+                    ci = line_end
+                else:
+                    ci = ci + 1
+            mut pstart = sp1 + 1
+            mut pend   = line_end
+            if sp2 >= 0:
+                pend = sp2
+                req.version = Str.slice(raw, sp2 + 1, line_end)
+                req.version_owned = true
+            mut q = -1
+            ci = pstart
+            while ci < pend:
+                if Str.char_at(raw, ci) == 63:    # '?' splits PATH from QUERY
+                    q = ci
+                    ci = pend
+                else:
+                    ci = ci + 1
+            if q >= 0:
+                req.path  = Str.slice(raw, pstart, q)
+                req.query = Str.slice(raw, q + 1, pend)
+            else:
+                req.path  = Str.slice(raw, pstart, pend)
+        # Lazy headers: store the raw header block [line_end+2, header_end) as a
+        # fresh inline slice (sole owner, freed by free_owned); header() scans it on
+        # demand instead of eagerly building a Map of every header per request.
+        if line_end >= 0 and line_end + 2 < header_end:
+            req._raw_hdr = Str.slice(raw, line_end + 2, header_end)
+
+    # Parse `raw` (a raw header block, lines after the request line) into `into`,
+    # lowercasing each header name. Used by HttpRequest.headers_map() to populate
+    # the full Map lazily for callers that want to iterate all headers.
+    pub def _parse_headers_into(raw: str, into: Map[str, str]):
         mut hdr_pos = 0
-        mut hdr_len = Str.len(rest_hdrs)
+        mut hdr_len = Str.len(raw)
         while hdr_pos < hdr_len:
-            mut tail     = Str.slice(rest_hdrs, hdr_pos, hdr_len)
+            mut tail     = Str.slice(raw, hdr_pos, hdr_len)
             mut line_end = Str.index_of(tail, "\r\n")
-            mut line     = tail
+            mut line_len = line_end
             if line_end >= 0:
-                line    = Str.slice(tail, 0, line_end)
                 hdr_pos = hdr_pos + line_end + 2
             else:
-                hdr_pos = hdr_len
+                line_len = Str.len(tail)
+                hdr_pos  = hdr_len
+            mut line  = Str.slice(tail, 0, line_len)
             mut colon = Str.index_of(line, ": ")
             if colon >= 0:
-                mut hname  = Str.slice(line, 0, colon)
-                mut hvalue = Str.slice(line, colon + 2, Str.len(line))
-                req.headers.insert(hname, hvalue)
-        return req
+                mut hname_raw = Str.slice(line, 0, colon)
+                mut hname     = Str.to_lower(hname_raw)
+                unsafe: _tr_c_free(hname_raw as Pointer[char])
+                into.insert(hname, Str.slice(line, colon + 2, Str.len(line)))
+                unsafe: _tr_c_free(hname as Pointer[char])
+            unsafe: _tr_c_free(line as Pointer[char])
+            unsafe: _tr_c_free(tail as Pointer[char])
+
+    # Content-Length value from a raw header section, or 0 when absent.
+    pub def content_length(hdr: str) -> int:
+        mut low = Str.to_lower(hdr)
+        mut idx = Str.index_of(low, "content-length:")
+        if idx < 0:
+            unsafe: _tr_c_free(low as Pointer[char])
+            return 0
+        mut after = Str.slice(low, idx + 15, Str.len(low))
+        unsafe: _tr_c_free(low as Pointer[char])
+        mut nl  = Str.index_of(after, "\r\n")
+        mut val = after
+        mut val_is_after = true
+        if nl >= 0:
+            val = Str.slice(after, 0, nl)
+            val_is_after = false
+        mut trimmed = Str.trim(val)
+        if not val_is_after:
+            unsafe: _tr_c_free(val as Pointer[char])
+        unsafe: _tr_c_free(after as Pointer[char])
+        mut result = Str.parse_int(trimmed)
+        unsafe: _tr_c_free(trimmed as Pointer[char])
+        return result
 
 # ── HttpMiddleware interface ───────────────────────────────────────────────────
 
@@ -387,6 +876,7 @@ pub class HttpServer:
     pub _running:    bool
     pub _router:     HttpRouter
     pub _recv_buf:   int
+    pub _max_body:   int   # reject request bodies larger than this many bytes (0 = unlimited)
 
 extend HttpServer:
     pub def init(host: str, port: int) -> HttpServer:
@@ -395,7 +885,16 @@ extend HttpServer:
         s.port       = port
         s._running   = false
         s._router    = HttpRouter.init()
-        s._recv_buf  = 65536
+        # Default body cap: 8 MiB. Guards against a client sending a huge (or
+        # lying) Content-Length and exhausting memory. Raise via set_max_body()
+        # for large uploads, or set 0 to disable the cap.
+        s._max_body  = 8388608
+        # 16 KiB: per-recv() chunk size + StringBuilder seed capacity. recv()
+        # mallocs (cap+1) on every call, so under high concurrency each in-flight
+        # green thread holds one such buffer - 16 KiB keeps that transient small
+        # while still reading typical request headers in a single recv(); the
+        # StringBuilder grows automatically for larger requests/bodies.
+        s._recv_buf  = 16384
         return s
 
     # Attach a pre-built router (optional — use server.router() to get the internal one).
@@ -410,6 +909,12 @@ extend HttpServer:
     pub def set_recv_buf(self, bytes: int):
         self._recv_buf = bytes
 
+    # Set the maximum accepted request-body size in bytes (0 = unlimited).
+    # Requests whose Content-Length exceeds this are flagged oversized; the
+    # body read is also capped so an oversized/lying length can't exhaust memory.
+    pub def set_max_body(self, bytes: int):
+        self._max_body = bytes
+
     # Bind and listen. Returns true on success.
     pub def start(self) -> bool:
         self._listener = TcpListener.listen(self.host, self.port)
@@ -421,13 +926,117 @@ extend HttpServer:
     pub def is_running(self) -> bool:
         return self._running
 
-    # Block until the next client connects, parse the request, run the router,
-    # and return an HttpConn ready for the handler to write a response.
+    # Read a complete HTTP request from a stream: loop recv() until the header
+    # terminator (\r\n\r\n) arrives, then keep reading until the full
+    # Content-Length body has been received. Robust against requests that span
+    # multiple TCP segments (a single recv() is not guaranteed to be complete).
+    # Note: text-protocol oriented (JSON/forms/HTML); a body containing NUL
+    # bytes is truncated by the string representation.
+    def _read_full(self, stream: TcpStream) -> str:
+        # Fast path: a single recv() that already holds the whole request -- the
+        # common case for small keep-alive requests. The recv buffer IS the raw
+        # request, so return it directly: no StringBuilder, no to_owned() copies.
+        # Only fall back to accumulation when the request spans TCP segments.
+        mut first = stream.recv(self._recv_buf)
+        mut flen  = Str.len(first)
+        if flen == 0:
+            return first
+        mut he = Str.index_of(first, "\r\n\r\n")
+        if he >= 0:
+            mut hdr  = Str.slice(first, 0, he)
+            mut clen = HttpParser.content_length(hdr)
+            unsafe: _tr_c_free(hdr as Pointer[char])
+            mut cap_total = clen
+            if self._max_body > 0 and clen > self._max_body:
+                cap_total = self._max_body + 1
+            if flen - (he + 4) >= cap_total:
+                return first
+        # Slow path: accumulate across recvs (headers split over segments, or a
+        # body still arriving). Seed the builder with what we already read.
+        mut sb         = StringBuilder.init(self._recv_buf)
+        sb.append(first)
+        unsafe: _tr_c_free(first as Pointer[char])
+        mut header_end = he
+        while header_end < 0:
+            mut chunk = stream.recv(self._recv_buf)
+            if Str.len(chunk) == 0: break
+            sb.append(chunk)
+            unsafe: _tr_c_free(chunk as Pointer[char])
+            header_end = Str.index_of(sb.as_str(), "\r\n\r\n")
+        if header_end < 0:
+            mut raw0 = sb.to_owned()
+            sb.free()
+            return raw0
+        mut raw = sb.to_owned()
+        mut hdr_for_clen = Str.slice(raw, 0, header_end)
+        mut clen2 = HttpParser.content_length(hdr_for_clen)
+        unsafe: _tr_c_free(hdr_for_clen as Pointer[char])
+        mut have = Str.len(raw) - (header_end + 4)
+        unsafe: _tr_c_free(raw as Pointer[char])
+        # Cap how much body we accumulate: stop once we've read past the limit
+        # (plus the headers already buffered) so a huge/lying Content-Length
+        # cannot drive unbounded memory growth. read_next() flags the request
+        # oversized from the declared Content-Length and the handler returns 413.
+        mut cap_total2 = clen2
+        if self._max_body > 0 and clen2 > self._max_body:
+            cap_total2 = self._max_body + 1
+        while have < cap_total2:
+            mut more = stream.recv(self._recv_buf)
+            if Str.len(more) == 0: break
+            sb.append(more)
+            unsafe: _tr_c_free(more as Pointer[char])
+            have = have + Str.len(more)
+        mut result = sb.to_owned()
+        sb.free()
+        return result
+
+    # Read one HTTP request off an already-connected stream and run the router.
+    # Returns an HttpRequest with an empty `method` if the client closed the
+    # connection (or sent garbage with no header terminator) - callers should
+    # treat that as "no more requests on this connection".
+    pub def read_next(self, stream: TcpStream) -> HttpRequest:
+        mut raw = HttpServer._read_full(self, stream)
+        if Str.len(raw) == 0 or Str.index_of(raw, "\r\n\r\n") < 0:
+            unsafe: _tr_c_free(raw as Pointer[char])
+            mut empty = HttpRequest.init()
+            empty.method = ""
+            return empty
+        mut req = HttpParser.parse(raw)
+        unsafe: _tr_c_free(raw as Pointer[char])
+        # Flag oversized requests from the (already-parsed) Content-Length header
+        # so the dispatch layer can reject them with 413 without trusting the
+        # truncated body that _read_full deliberately stopped accumulating.
+        if self._max_body > 0:
+            mut cl: str = req.header("content-length")
+            if Str.len(cl) > 0 and Str.parse_int(cl) > self._max_body:
+                req.oversized = true
+            unsafe: _tr_c_free(cl as Pointer[char])
+        self._router.dispatch(req)
+        return req
+
+    # Like read_next(), but parses into an EXISTING request object (keep-alive
+    # reuse) instead of allocating a new one. Returns false when the connection
+    # closed or sent garbage (caller should stop serving it), true otherwise.
+    pub def read_next_into(self, stream: TcpStream, req: HttpRequest) -> bool:
+        mut raw = HttpServer._read_full(self, stream)
+        if Str.len(raw) == 0 or Str.index_of(raw, "\r\n\r\n") < 0:
+            unsafe: _tr_c_free(raw as Pointer[char])
+            return false
+        HttpParser.parse_into(req, raw)
+        unsafe: _tr_c_free(raw as Pointer[char])
+        if self._max_body > 0:
+            mut cl: str = req.header("content-length")
+            if Str.len(cl) > 0 and Str.parse_int(cl) > self._max_body:
+                req.oversized = true
+            unsafe: _tr_c_free(cl as Pointer[char])
+        self._router.dispatch(req)
+        return true
+
+    # Block until the next client connects, read the full request, run the
+    # router, and return an HttpConn ready for the handler to write a response.
     pub def accept(self) -> HttpConn:
         mut stream = self._listener.accept()
-        mut raw    = stream.recv(self._recv_buf)
-        mut req    = HttpParser.parse(raw)
-        self._router.dispatch(req)
+        mut req    = HttpServer.read_next(self, stream)
         return HttpConn.init(req, stream)
 
     # Stop accepting new connections.

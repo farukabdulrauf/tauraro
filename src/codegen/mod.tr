@@ -1,9 +1,11 @@
-# compiler/src/codegen/mod.tr — Codegen backend registry.
+# @trusted: compiler systems module — audited raw-pointer core (like Rust std internals)
+# compiler/src/codegen/mod.tr - Codegen backend registry.
 #
 # Re-exports all available backends so callers can do:
 #   from codegen import CGenerator, LlvmGenerator
 #
 # New backends (MIR, WASM, etc.) should be added here.
 
-from codegen.c    import CGenerator
-from codegen.llvm import LlvmGenerator
+from codegen.c      import CGenerator
+from codegen.llvm   import LlvmGenerator
+from codegen.native import NativeGenerator

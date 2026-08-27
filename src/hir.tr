@@ -1,11 +1,12 @@
-# compiler/src/hir.tr — High-level Intermediate Representation
+# @trusted: compiler systems module — audited raw-pointer core (like Rust std internals)
+# compiler/src/hir.tr - High-level Intermediate Representation
 
 from core.vec import Vec
 from core.alloc import alloc, dealloc
 from core.string import StringObj
 from ast import AstType, Decorator, Pattern, Ownership
 
-# ─── Expressions ──────────────────────────────────────────────────────────────
+# --- Expressions --------------------------------------------------------------
 
 pub enum HirExpr:
     ELitInt(val: int, ty: AstType)
@@ -43,6 +44,16 @@ pub enum HirExpr:
     ERange(start: Pointer[HirExpr], end: Pointer[HirExpr], inclusive: bool, ty: AstType)
     ESizeOf(target_ty: AstType, ty: AstType)
     EIfElse(cond: Pointer[HirExpr], then_e: Pointer[HirExpr], else_e: Pointer[HirExpr], ty: AstType)
+    # `do:` block-expression — body runs, value is the last bare expression.
+    EDo(body: HirBlock, ty: AstType)
+    # `match` block-expression — each arm.body is a single SExpr(EDo) whose value
+    # is the arm's result; codegen dispatches into a result temp.
+    EMatchExpr(subj: Pointer[HirExpr], arms: Vec[HirMatchArm], ty: AstType)
+    # `loop:` block-expression — infinite loop; value comes from `break <value>`.
+    ELoop(body: HirBlock, ty: AstType)
+    # `while c:` block-expression — value from `break <value>`, or the `else:`
+    # block on normal exit (else_body empty if absent).
+    EWhileExpr(cond: Pointer[HirExpr], body: HirBlock, else_body: HirBlock, ty: AstType)
 
 
 pub class HirComprehension:
@@ -57,32 +68,36 @@ pub class HirCatchClause:
     pub body: HirBlock
 
 pub class HirFStringPart:
-    pub is_expr: bool
-    pub text: str
-    pub expr: Pointer[HirExpr]
+    pub is_expr:  bool
+    pub text:     str
+    pub expr:     Pointer[HirExpr]
+    pub fmt_spec: str    # e.g. ".2f", ">10", "05d"
 
 extend HirFStringPart:
     pub def init() -> HirFStringPart:
         mut p = HirFStringPart()
-        p.is_expr = false
-        p.text = ""
-        p.expr = Pointer[HirExpr](0)
+        p.is_expr  = false
+        p.text     = ""
+        p.expr     = Pointer[HirExpr](0)
+        p.fmt_spec = ""
         return p
 
-# ─── Match arms ─────────────────────────────────────────────────────────────
+# --- Match arms -------------------------------------------------------------
 
 pub class HirMatchArm:
-    pub pat: Pattern
-    pub body: HirBlock
+    pub pat:   Pattern
+    pub body:  HirBlock
+    pub guard: Pointer[HirExpr]   # null = no guard; non-null = `case P if guard:`
 
 extend HirMatchArm:
     pub def init(pat: Pattern, body: HirBlock) -> HirMatchArm:
         mut a = HirMatchArm()
-        a.pat = pat
-        a.body = body
+        a.pat   = pat
+        a.body  = body
+        a.guard = Pointer[HirExpr](0)
         return a
 
-# ─── Chan-select arms ─────────────────────────────────────────────────────────
+# --- Chan-select arms ---------------------------------------------------------
 
 pub class HirChanSelectArm:
     pub kind: int                       # 0=recv, 1=send, 2=timeout, 3=default
@@ -92,14 +107,16 @@ pub class HirChanSelectArm:
     pub timeout_ms: Pointer[HirExpr]
     pub body: HirBlock
 
-# ─── Statements ───────────────────────────────────────────────────────────────
+# --- Statements ---------------------------------------------------------------
 
 pub enum HirStmt:
     SExpr(expr: Pointer[HirExpr])
     SLet(name: str, ownership: Ownership, is_mut: bool, is_const: bool, is_shared: bool, ty: AstType, val: Pointer[HirExpr])
     SAssign(target: Pointer[HirExpr], val: Pointer[HirExpr])
-    SReturn(val: Pointer[HirExpr])    
-    SBreak
+    SReturn(val: Pointer[HirExpr])
+    # `break` with an optional value (null Pointer for a plain break) — a value
+    # is the result of an enclosing `loop:`/`while:` block-expression.
+    SBreak(val: Pointer[HirExpr])
     SContinue
     SPass
     SRaise(val: Pointer[HirExpr])
@@ -119,6 +136,9 @@ pub enum HirStmt:
     SFree(name: str)
     SMultiLet(names: Vec[str], is_mut: bool, val: Pointer[HirExpr])
     SChanSelect(cases: Vec[Pointer[HirChanSelectArm]])
+    SDefer(stmt: Pointer[HirStmt])   # defer - deferred execution at function exit
+    SAutoDrop(name: str, class_name: str)  # compiler-inserted .free() for an owned, unmoved, unborrowed local going out of scope
+    SLineMarker(n: int)   # source-line marker (1 per source statement); emits a `#line` directive in --debug builds, else a no-op comment
 
 pub class HirBlock:
     pub stmts: Vec[Pointer[HirStmt]]
@@ -132,7 +152,7 @@ extend HirBlock:
     pub def push(self, s: Pointer[HirStmt]):
         self.stmts.push(s)
 
-# ─── Declarations ─────────────────────────────────────────────────────────────
+# --- Declarations -------------------------------------------------------------
 
 pub class HirParam:
     pub name: str
@@ -150,9 +170,23 @@ pub class HirFunction:
     pub is_async: bool
     pub is_extern: bool
     pub is_public: bool
+    pub is_export: bool
     pub is_static: bool
     pub is_variadic: bool
     pub is_decorator: bool
+    pub borrow_borrowers: Vec[str]   # outlives engine: ref-borrow edge borrowers ...
+    pub borrow_sources:   Vec[str]   # ... and their immediate sources (parallel arrays),
+                                     # collected by sema (cross-fn), consumed by the MIR.
+    pub proven_borrows:   Vec[str]   # outlives engine result: borrow locals whose source
+                                     # PROVABLY outlives them → codegen elides their refcount.
+    pub returns_owned:    bool       # return-ownership inference: true = every return path
+                                     # yields an OWNED heap-class reference (fresh/retained/
+                                     # transferred), so a caller binding the result OWNS it and
+                                     # must release it. false = a return may be a BORROW (alias
+                                     # via collection .get / a borrow-returning callee) → the
+                                     # caller must NOT drop it (leak-safe). Only meaningful when
+                                     # ret_ty is a heap class; computed by a whole-program
+                                     # fixpoint in sema, consumed by codegen `_obj_expr_owns_ref`.
 
 pub class HirField:
     pub name: str
@@ -197,30 +231,36 @@ pub class HirProgram:
     pub top_level_stmts: Vec[Pointer[HirStmt]]
     pub extern_funcs:    Vec[HirFunction]   # extern "C" declarations
     pub decorator_defs:  Vec[HirFunction]   # decorator def ... functions
+    pub type_alias_names:  Vec[str]              # type Name = Target
+    pub type_alias_types:  Vec[Pointer[AstType]] # parallel array - must be Pointer since AstType is a class
 
 extend HirProgram:
     pub def init() -> HirProgram:
         mut p = HirProgram()
-        p.functions = Vec[HirFunction].init(16)
-        p.classes = Vec[HirClass].init(16)
-        p.enums = Vec[HirEnum].init(4)
-        p.interfaces = Vec[HirInterface].init(4)
-        p.top_level_stmts = Vec[Pointer[HirStmt]].init(16)
-        p.extern_funcs = Vec[HirFunction].init(4)
-        p.decorator_defs = Vec[HirFunction].init(4)
+        p.functions         = Vec[HirFunction].init(16)
+        p.classes           = Vec[HirClass].init(16)
+        p.enums             = Vec[HirEnum].init(4)
+        p.interfaces        = Vec[HirInterface].init(4)
+        p.top_level_stmts   = Vec[Pointer[HirStmt]].init(16)
+        p.extern_funcs      = Vec[HirFunction].init(4)
+        p.decorator_defs    = Vec[HirFunction].init(4)
+        p.type_alias_names  = Vec[str].init(4)
+        p.type_alias_types  = Vec[Pointer[AstType]].init(4)
         return p
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# --- Helpers ------------------------------------------------------------------
 
 pub def box_hirexpr(e: HirExpr) -> Pointer[HirExpr]:
-    mut p = alloc[HirExpr](1)
-    p.write(e)
-    return p
+    unsafe:
+        mut p = alloc[HirExpr](1)
+        p.write(e)
+        return p
 
 pub def box_hirstmt(s: HirStmt) -> Pointer[HirStmt]:
-    mut p = alloc[HirStmt](1)
-    p.write(s)
-    return p
+    unsafe:
+        mut p = alloc[HirStmt](1)
+        p.write(s)
+        return p
 
 pub def hir_expr_type(e: Pointer[HirExpr]) -> AstType:
     if e as usize == 0 as usize: return AstType.init("void")
@@ -238,12 +278,33 @@ pub def hir_expr_type(e: Pointer[HirExpr]) -> AstType:
         case HirExpr.EUnaryOp(_, _, ty): return ty
         case HirExpr.ECall(_, _, ty): return ty
         case HirExpr.EMethodCall(_, _, _, ty): return ty
-        case HirExpr.EPropAccess(_, _, ty): return ty
+        case HirExpr.EPropAccess(_, _, ty):
+            # A `Bits[T; N]` bitfield READS as its storage type T (an integer), so print /
+            # arithmetic / assignment treat it as a scalar. The struct emitter reads the field
+            # DECLARATION's type directly, so the `: N` bitfield form is still emitted.
+            if ty.name == "Bits" and ty.args.len > 0: return ty.args.get(0).read()
+            return ty
         case HirExpr.EIndex(_, _, ty): return ty
         case HirExpr.ECast(_, ty): return ty
         case HirExpr.EFString(_, ty): return ty
         case HirExpr.ETryExpr(_, ty): return ty
-        case HirExpr.EClosure(_, _, _, _, _): return AstType.init("lambda")
+        case HirExpr.EClosure(_cl_ps, _cl_ret, _, _, _):
+            # A `def(...)->R` value: carry the signature as a "def" type whose
+            # args are the parameter types followed by the return type, so a call
+            # `f(x)` can infer R (a bare "lambda" lost it -> results became void*).
+            mut _clt = AstType.init("def")
+            mut _cli = 0
+            while _cli < _cl_ps.len:
+                unsafe:
+                    mut _clp = alloc[AstType](1)
+                    _clp.write(_cl_ps.get(_cli).ty)
+                    _clt.args.push(_clp)
+                _cli = _cli + 1
+            unsafe:
+                mut _clrp = alloc[AstType](1)
+                _clrp.write(_cl_ret)
+                _clt.args.push(_clrp)
+            return _clt
         case HirExpr.ESuperMethodCall(_, _, _, ty): return ty
         case HirExpr.ESuperPropAccess(_, _, ty): return ty
         case HirExpr.EList(_, ty): return ty
@@ -260,6 +321,10 @@ pub def hir_expr_type(e: Pointer[HirExpr]) -> AstType:
         case HirExpr.ERange(_, _, _, ty): return ty
         case HirExpr.ESizeOf(_, ty): return ty
         case HirExpr.EIfElse(_, _, _, ty): return ty
+        case HirExpr.EDo(_, ty): return ty
+        case HirExpr.EMatchExpr(_, _, ty): return ty
+        case HirExpr.ELoop(_, ty): return ty
+        case HirExpr.EWhileExpr(_, _, _, ty): return ty
         case _:
             pass
     return AstType.init("void")

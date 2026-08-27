@@ -46,6 +46,7 @@ The `mod.tr` form: a directory with a `mod.tr` file inside. This lets you split 
 | `import mod as alias` | Long module paths; alias makes usage concise |
 | `from mod import name` | Using 1-3 specific names from a module |
 | `from mod import name as alias` | Avoiding name collisions between two imports |
+| `from mod import *` | Bringing in *all* of a module's public names at once |
 
 ### `import`
 
@@ -102,6 +103,25 @@ from graphics.vec import Vec2   # ERROR: 'Vec2' already imported in this scope
 from graphics.vec import Vec2 as GVec2
 ```
 
+### `from ... import *` (wildcard import)
+
+```python
+from math.geometry import *
+from core.string import *
+
+def main():
+    mut a = circle_area(5.0)     # every public name of the module is in scope
+    mut u = to_upper("hello")
+```
+
+**How it works:** `*` brings in **all** of the module's public (`pub`) declarations — functions,
+classes, enums, constants — without listing them. Private (non-`pub`) names are never imported. Works
+with dotted paths (`from a.b.c import *`) and alongside other imports on separate lines. As with any
+import, a name collision with another in-scope symbol is a compile error.
+
+**When to prefer it:** pulling in a module whose whole surface you use (a prelude, a math library). For
+1–3 names, an explicit `from mod import a, b` reads better and documents the dependency.
+
 ### `from ... import ... as` (aliased selective import)
 
 ```python
@@ -141,6 +161,15 @@ The first match wins.
 | 9 | `packages/` | Project-local packages (CWD-relative) |
 | 10 | `packages/sites/` | Project-local site packages (CWD-relative) |
 | 11+ | `TAURARO_PATH` entries | User-specified extra paths (see below) |
+
+**Vendored taupkg dependencies:** Immediately after adding the grandparent
+search path (priority 4), the resolver scans the entry file's parent directory
+for subdirectories that contain a `src/` folder — the layout `taupkg build`
+produces when it vendors dependencies (e.g. `<project>/watax/src/`). Each such
+`<pkgname>/src` directory is added as a search path automatically, so a
+vendored package's own sibling-relative imports (e.g. `from app import App`
+inside `watax.tr`) resolve without any extra configuration, and
+`from <pkgname> import X` finds `<pkgname>/src/<pkgname>.tr`.
 
 **Recursive resolution:** Each imported module is scanned for its own imports, which are resolved transitively. The compiler builds the full dependency graph before emitting any C.
 

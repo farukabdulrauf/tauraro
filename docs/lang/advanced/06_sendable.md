@@ -54,14 +54,16 @@ mut ch: Chan[MyClass] = Chan[MyClass].init(16)
 | Type | Sendable | Notes |
 |------|----------|-------|
 | `int`, `float`, `bool`, `char` | Yes | Primitive — copied on send |
-| `str` | Yes | Immutable — safe to share |
-| `Shared[T]` | Yes | Reference-counted — atomic refcount |
-| `Mutex[T]` | Yes | Lock-protected mutation |
-| `RwLock[T]` | Yes | Read-write lock |
-| `Atomic[T]` | Yes | Lock-free atomic operations |
-| `Chan[T]` | Yes | Thread-safe by design |
-| `Pointer[T]` | Yes (but unsafe) | Raw pointer — inherently unsafe, you take responsibility |
-| `List[T]`, `Dict`, plain classes | **No** | Not thread-safe — use `Shared[T]` to wrap |
+| `str` | Yes | Owned + read-only on the worker; the caller keeps ownership. Safe when the caller outlives the thread (the structured APIs `join`); a *detached* thread must not outlive it. |
+| `Shared[T]` / `Weak[T]` | If `T` is | Reference-counted with an **atomic** refcount (the `Arc` equivalent). Sendable **only if `T` is Sendable** — checked transitively, so non-thread-safe data can't be reached through the handle. |
+| `Chan[T]` | If `T` is | Thread-safe channel; sends a `T` to another thread, so `T` must be Sendable. |
+| `Mutex[T]` | Yes | Lock-protected mutation (serializes access to `T`). |
+| `RwLock[T]` | Yes | Read-write lock. |
+| `Atomic[T]` | Yes | Lock-free atomic operations. |
+| `Pointer[T]` | Only with `UnsafeSendable` | Raw pointer — the compiler can't prove it thread-safe; assert `implements Sendable, UnsafeSendable` to take responsibility (Tauraro's `unsafe impl Send`). |
+| `List[T]`, `Dict`, `Set` | **No** | Not thread-safe (unsynchronized mutation) — wrap in `Shared[T]` / `Mutex[T]`. |
+| a **plain class** instance | **No** (`[T-7]`) | Every heap class is reference-counted; a *plain* class uses a **non-atomic** refcount, so it is `!Send` exactly like Rust's `Rc` — two threads retaining/releasing it would race the count. Use `Shared[T]` (atomic `Arc`). |
+| a **borrow** `ref T` / `mut ref T` | **No** | A borrow can dangle or race across threads (`[T-6]`); send an owned value or a handle. |
 
 ---
 
@@ -100,72 +102,140 @@ task_group:
 
 ---
 
-### [T-2] Race Condition Detected
+### [T-2] Sendable Class Has a Non-Sendable Field
 
 ```
-error [T-2]: race condition — 'counter' is mutated by multiple threads without synchronization
+error [T-2]: Class 'Counter' declares 'implements Sendable' but field 'data: List[int]' is not Sendable.
+      FIX: Wrap 'data' in Mutex[List[int]] for exclusive access, RwLock[List[int]] for reader-writer,
+      or Atomic[T] for numeric/flag types.
+      Or remove 'implements Sendable' if 'Counter' is only used on one thread.
 ```
 
-**Cause:** Two or more concurrent operations read and write the same mutable value without a lock.
+**Cause:** A class declares `implements Sendable`, but one of its fields has a
+type that is not itself `Sendable` (e.g. a bare `List[T]` or another
+non-Sendable class). This would let the field be shared across threads without
+synchronization.
 
 **How it works:**
 
 ```python
-# WRONG: data race
-mut counter = 0
+# WRONG: declares Sendable but has a non-Sendable field
+class Counter implements Sendable:
+    pub items: List[int]    # T-2: List[int] is not Sendable
 
-def increment() -> void:
-    counter = counter + 1    # T-2: no synchronization
-
-task_group:
-    spawn increment()
-    spawn increment()
-
-# RIGHT: use Atomic or Mutex
-mut counter = Atomic[int].init(0)
-
-def increment_safe(c: Atomic[int]) -> void:
-    c.fetch_add(1)
-
-task_group:
-    spawn increment_safe(counter)
-    spawn increment_safe(counter)
+# RIGHT: wrap the field
+class Counter implements Sendable:
+    pub items: Mutex[List[int]]
 ```
 
 ---
 
-### [T-3] Potential Deadlock
+### [T-3] Primitive Field in a Sendable Class (warning)
 
 ```
-error [T-3]: potential deadlock — holding 'lock_a' while awaiting 'lock_b'
+warning [T-3]: Sendable class 'Counter' has primitive field 'count: int' that may cause
+      data races if mutated from multiple threads.
+      FIX: Use 'Atomic[int]' for safe concurrent mutation, or ensure this field
+      is written only before the object is shared across threads.
 ```
 
-**Cause:** The compiler detected a code path where a thread holds one lock while waiting to acquire another, which can deadlock if another thread acquires them in the opposite order.
+**Cause:** A `Sendable` class has a plain numeric/bool field. Unlike
+non-Sendable fields (which are a hard `[T-2]` error), primitive fields are
+*allowed* — but mutating them from multiple threads without `Atomic[T]` is a
+data race. This is a warning, not an error, because read-only or
+single-writer usage is safe.
 
 **How it works:**
 
 ```python
-mut lock_a = Mutex[int].init(0)
-mut lock_b = Mutex[int].init(0)
+# Triggers T-3 warning: 'count' could be raced on
+class Counter implements Sendable:
+    pub count: int
 
-def thread_1() -> void:
-    mut g_a = lock_a.lock()    # acquires lock_a
-    mut g_b = lock_b.lock()    # T-3: holding lock_a, acquiring lock_b
+# Fix: use Atomic[int] for fields mutated from multiple threads
+class Counter implements Sendable:
+    pub count: Atomic[int]
 
-def thread_2() -> void:
-    mut g_b = lock_b.lock()    # acquires lock_b
-    mut g_a = lock_a.lock()    # deadlock if thread_1 already holds lock_a
+def increment(c: Counter) -> void:
+    c.count.fetch_add(1)
 
-# RIGHT: always acquire locks in the same order
-def thread_1() -> void:
-    mut g_a = lock_a.lock()
-    mut g_b = lock_b.lock()
-    # ... both operations ...
-
-def thread_2() -> void:
-    mut g_a = lock_a.lock()    # same order as thread_1
-    mut g_b = lock_b.lock()
+task_group:
+    spawn increment(shared_counter)
+    spawn increment(shared_counter)
 ```
+
+### [T-6] Borrow Crosses a Thread Boundary
+
+```
+error [T-6]: a borrow (ref/mut ref) cannot cross a thread boundary
+```
+
+**Cause:** You passed a `ref`/`mut ref` borrow to `Thread.spawn`/`ThreadPool.spawn`/
+`spawn`. Spawn is not scoped, so the borrowed value could be mutated or freed by
+another thread, or outlive its source — the same reason Rust's `thread::spawn`
+requires `'static`. (`[T-1]` doesn't catch it because `ref T` erases to a Sendable `T`.)
+
+```python
+def run(x: mut ref int):
+    mut t = Thread.spawn(worker, x)   # T-6: borrow crosses the boundary
+    t.join()
+```
+
+**Fix:** pass an *owned* value, a `Shared[T]`, or a `Mutex[T]`/`Atomic[T]`.
+
+---
+
+### [T-7] Plain Reference-Counted Class Crosses a Thread
+
+```
+error [T-7]: 'Node' is a plain reference-counted class — its refcount is
+thread-local (non-atomic), so it is not 'Send' (exactly why Rust's 'Rc' is '!Send')
+```
+
+**Cause:** You passed a plain class instance across a thread boundary. Its refcount
+is non-atomic (fast, but single-thread-only); two threads adjusting it would race.
+Checked **transitively** — a plain class reached through a `Mutex[T]`, `Vec[T]`,
+`Dict`, or another class's field is rejected too.
+
+```python
+class Node:
+    pub v: int
+
+def worker(n: Node): ...
+
+# WRONG:
+mut n = Node(...)
+Thread.spawn(worker, n)          # T-7: Node's rc is non-atomic → !Send
+
+# RIGHT: Shared[T] has an atomic refcount (Arc)
+shared n = Node(...)
+Thread.spawn(worker, n.clone())  # OK
+```
+
+**Fix:** use `Shared[T]` for anything shared across threads.
+
+---
+
+### `UnsafeSendable` — the audited escape hatch
+
+`UnsafeSendable` is Tauraro's `unsafe impl Send/Sync`. Adding it to a class
+(`implements Sendable, UnsafeSendable`) asserts that **you have audited** the
+class's cross-thread safety, and opts it out of the automatic field check (`[T-2]`,
+including raw `Pointer` fields) **and** the refcount check (`[T-7]`). It is the small,
+explicit unsafe core a systems framework needs (like the `unsafe` inside
+hyper/tokio) — e.g. a read-only handle shared behind an atomic `Shared[T]`.
+
+```python
+class ConnJob implements Sendable, UnsafeSendable:   # audited: read-only App + owned conn
+    pub app:  Mutex[App]
+    pub conn: Mutex[HttpConn]
+```
+
+**The rule that keeps the guarantee honest:** a program that compiles **without**
+any `UnsafeSendable` has the *full*, machine-checked `Send`/`Sync` guarantee. Every
+`UnsafeSendable` is a labeled, greppable point where a human took responsibility —
+exactly like `unsafe` blocks. Use it only at a real framework boundary, never to
+silence an error in ordinary code.
 
 ---
 
@@ -320,7 +390,9 @@ By declaring `implements Sendable`, you assert this class is thread-safe. The co
 ---
 
 See also:
+- [09 — Safety Specification](09_safety_spec.md) — the normative statement of what Tauraro's concurrency safety guarantees, and the honest remaining gaps
 - [16 — Concurrency](../16_concurrency.md)
+- [07 — Concurrency Guide](07_concurrency_guide.md) — models, primitives, decision matrix
 - [03 — Channel Select](03_channel_select.md)
 - [02 — Advanced Ownership](02_advanced_ownership.md)
-- [Compiler Error T-1](../19_compiler_errors.md#t-1-no-implicit-type-coercion) (Sendable errors use the T-series codes)
+- [19 — Compiler Errors](../19_compiler_errors.md) (Sendable errors use the `[T-*]` codes)

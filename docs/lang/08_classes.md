@@ -300,6 +300,36 @@ field will be an empty string, numeric fields will be `0`. Always set every fiel
   readable.
 - Validate arguments at the top of `init` before touching any fields.
 
+### Releasing Resources: `dispose()` vs `free()`
+
+If your class owns a resource that the caller may want to release before the
+end of scope (a buffer, a connection, a builder — see [13 — Memory and
+Ownership §Advanced: Releasing Memory Early](13_memory_and_ownership.md#advanced-releasing-memory-early)),
+give it an explicit cleanup method. The name you choose matters:
+
+- **Name it `dispose()`** if an instance might ever be **constructed inside a
+  method, mutated, and then returned** to the caller:
+
+  ```python
+  extend Conn:
+      pub def take_buffer(self) -> Buffer:
+          mut raw = self.buf
+          raw.write(some_value)
+          return raw    # `raw` must still be valid after this line
+  ```
+
+  If `Buffer` had a method literally named `free`, the compiler's auto-drop
+  would see the local `raw` has a `free()` method and free it at scope
+  exit — **before** the `return` takes effect — leaving the caller with a
+  dangling value. Naming the method `dispose()` avoids this entirely.
+
+- **`free()` is fine** for classes that own their resource for their entire
+  lifetime and are never returned out of the scope that constructed them
+  (e.g. a private helper allocated and released within the same function).
+
+When in doubt, prefer `dispose()` — it is safe in every case, whereas `free()`
+is only safe for the narrower "owns it forever, never returned" pattern.
+
 ---
 
 ## 6. Visibility (`pub`)
@@ -568,7 +598,85 @@ See [21 — Operator Overloading](21_operator_overloading.md) for the complete r
 
 ---
 
-## 10. C Code Generation Reference
+## 10. Class Decorators — `@copy` and `@packed`
+
+A decorator written on the line above `class`, `enum`, or `interface` changes how
+the compiler treats that type. Two are built in.
+
+### `@copy` — opt into shareable (value) semantics
+
+By default, a class with at least one non-primitive field (a `List`, `str`-bearing
+struct, another class, etc.) is **move-tracked**: assigning it transfers ownership.
+
+```python
+class Label:
+    pub text: str
+    pub ids:  List[int]
+
+mut a = make_label()
+mut b = a            # MOVE — a is now consumed
+print(a.text)        # ERROR [M-1]: 'a' was moved and cannot be used again
+```
+
+Mark the class `@copy` to tell the compiler the instance is **freely shareable** —
+assignment then aliases the instance instead of moving it, so every handle stays
+usable:
+
+```python
+@copy
+class Label:
+    pub text: str
+    pub ids:  List[int]
+
+mut a = make_label()
+mut b = a            # @copy — aliases a (no move)
+print(a.text)        # OK
+b.ids.append(3)      # a and b refer to the same Label
+```
+
+**What it means / when to use it.** `@copy` is your assertion that the type is safe
+to share — typically because it is **immutable after construction**, or
+**arena/long-lived and never individually freed**. The compiler then exempts it
+from move-tracking. This is the same opt-in mechanism the Tauraro compiler uses on
+its own AST node types (`AstType`), which are built once and aliased throughout
+compilation. Use it deliberately; do not slap it on types with unique ownership of
+a resource that must be freed exactly once.
+
+> Classes whose fields are **all** primitive (`int`, `float`, `bool`, `char`, and
+> the like) are already treated as copy automatically — you do not need `@copy`
+> for those.
+
+`@copy` is also accepted on `enum` and `interface` declarations, with the same
+"exempt from move-tracking" meaning.
+
+```python
+@copy
+enum Direction:
+    North
+    South
+
+@copy
+interface Shape:
+    def area(self) -> int
+```
+
+### `@packed` — exact byte layout
+
+`@packed` removes field padding so the struct matches a precise on-the-wire or
+hardware layout (see §2 and the `NetworkHeader` example). Use it only for
+interop structs; packed access can be slower on some architectures.
+
+```python
+@packed
+class NetworkHeader:
+    pub version: u8
+    pub length:  u16
+    pub seq:     u32
+```
+
+---
+
+## 11. C Code Generation Reference
 
 Understanding what Tauraro emits helps you reason about performance and debug C-level issues.
 
@@ -585,6 +693,30 @@ Understanding what Tauraro emits helps you reason about performance and debug C-
 
 There is no vtable in the struct unless an interface is involved. All dispatch is a direct
 function call — zero overhead compared to hand-written C.
+
+---
+
+## Value Types (`@value_type`)
+
+By default a class is a **reference type**: heap-allocated, reference-counted,
+shared by pointer. For a small, immutable, copy-friendly type (a point, a color, a
+date, a borrowed view) you can instead mark it `@value_type` to make it a **stack
+value** — like a C struct or Rust's `Copy` types: no heap allocation, no refcount,
+passed and returned by value, and stored **inline** in collections
+(`List[Point]`, `Dict[str, Point]`, `Set[Point]` pack the structs directly, like
+Rust's `Vec`/`HashMap`/`HashSet`).
+
+```python
+@value_type
+pub class Point:
+    pub x: int
+    pub y: int
+```
+
+This is the lever that lets such types match Rust's performance on hot paths. The
+rules and trade-offs (POD fields only, value semantics, generic and mutating value
+types, value types in collections) are covered in
+[Advanced: Decorators → `@value_type`](../advanced/05_decorators.md).
 
 ---
 

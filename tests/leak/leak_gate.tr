@@ -1,0 +1,216 @@
+# Leak gate (Phase 0) — regression detector for memory leaks.
+#
+# Run via scripts/leak_check.sh / .ps1, which builds this with -DTAURARO_MEMCOUNT
+# so the runtime tracks net live allocations. The gate runs a workload of
+# leak-prone patterns in a loop and asserts the live-allocation count does NOT
+# grow: a real leak shows up as POSITIVE growth, while the counter's known
+# under-counting of some primitive collections only ever drifts <= 0. So
+# `leaked <= 0` is a sound "no new leak" signal; `leaked > 0` fails the gate.
+#
+# As Phase 1+ make more patterns provably leak-free, widen `workload()`.
+
+extern "C":
+    def _tr_mem_live() -> int
+
+# Heap classes for the class-instance ARC workload below. `Tag` carries a `str`
+# field so its drop must release both the field buffer and the struct.
+class Point:
+    pub x: int
+    pub y: int
+extend Point:
+    pub def init(x: int, y: int) -> Point:
+        mut p = Point()
+        p.x = x
+        p.y = y
+        return p
+
+class Tag:
+    pub name: str
+extend Tag:
+    pub def init(n: str) -> Tag:
+        mut t = Tag()
+        t.name = n
+        return t
+
+def dist(a: Point, b: Point) -> int:      # classes passed BY reference (borrowed)
+    mut dx = a.x - b.x
+    return dx * dx
+
+def make_tag(prefix: str, n: int) -> Tag: # FREE FUNCTION returning an OWNED instance
+    return Tag.init(prefix + n.to_str())   # (interproc inference must reclaim its result)
+
+# Holder OWNS a nested heap-class field (`Tag`, which itself owns a `str`). Its
+# drop must recursively release the Tag (and the Tag its str) — the recursive
+# _trdrop_T path.
+class Holder:
+    pub t: Tag
+extend Holder:
+    pub def init(tg: Tag) -> Holder:
+        mut h = Holder()
+        h.t = tg
+        return h
+
+# Bin OWNS a collection field of heap-class elements (only ever assigned a fresh
+# Vec) — its drop must free the Vec AND release each Tag (recursive _trdrop_T +
+# _coll_field_free_call + List_ptr_free_obj).
+class Bin:
+    pub items: Vec[Tag]
+extend Bin:
+    pub def init() -> Bin:
+        mut b = Bin()
+        b.items = Vec[Tag].init(4)
+        return b
+    pub def put(self, t: Tag):
+        self.items.append(t)
+
+# Exercise the string + map paths that are fully ref-counted/auto-dropped.
+def workload():
+    mut s = "abc" + "def"          # fresh concat, auto-dropped at scope exit
+    mut t = s.to_upper()           # another owned string
+    mut n = t.len()
+
+    mut d: Dict[str, int] = {}     # str-keyed dict, auto-dropped
+    d.insert("alpha", 1)
+    d.insert("beta", 2)
+
+    mut m: Map[str, str] = Map[str, str].init(4)
+    m.insert("k", "v")             # boxed str value (the #54 path)
+    m.free()
+
+    # `do:` block-expression yielding a fresh owned string: the block's locals
+    # are auto-dropped while the yielded value escapes (must not leak/double-free).
+    mut g = do:
+        mut name = "wor" + "ld"
+        mut msg = "hello, " + name  # `name` dropped at block exit, `msg` escapes
+        msg
+    mut glen = g.len()             # `g` auto-dropped at scope exit
+
+    # `do:` nested in a parenthesized expression yielding a string.
+    mut p = ("[" + (do:
+        mut inner = "x" + "y"
+        inner
+    ))
+    mut plen = p.len()
+
+    # `if`-expression yielding a fresh owned string from each branch.
+    mut q = if glen > 2:
+        mut a = "yes" + "!"
+        a
+    else:
+        "no"
+    mut qlen = q.len()
+
+    # if-expression result used directly as a concat operand (owned, released).
+    # Paren-nested block-expressions put the closing paren on its own line.
+    mut r = "<" + (if plen > 0:
+        "h" + "it"
+    else:
+        "miss"
+    )
+    mut rlen = r.len()
+
+    # match-expression yielding a fresh owned string per arm.
+    mut u = match rlen:
+        case 0: "empty"
+        case _:
+            mut w = "len" + "gth"
+            w
+    mut ulen = u.len()
+
+    # match-expression result used directly as a concat operand.
+    mut v = ">" + (match qlen:
+        case 0: "z" + "ero"
+        case _: "non" + "zero"
+    )
+    mut vlen = v.len()
+
+    # loop: expression yielding a fresh owned string via `break <value>`.
+    mut ll = loop:
+        mut bse = "lo" + "op"
+        break bse + "!"
+    mut lllen = ll.len()
+
+    # while: expression yielding an owned string on the break path.
+    mut cnt = 0
+    mut wv = while cnt < 3:
+        cnt = cnt + 1
+        if cnt == 2:
+            break "wh" + "ile"
+    else:
+        "done"
+    mut wvlen = wv.len()
+
+    # Closure bound to a local: the capture env is stack-allocated (no heap, no
+    # leak across the 5000-iteration workload). Captures `capv` by reference.
+    mut capv = 10
+    mut cf = def (x: int) -> int:
+        return capv + x
+    mut cfr = cf(5)            # 15
+
+    # Heap class instances: factory-constructed (Point.init / Tag.init), passed as
+    # a borrowed argument (dist), and returned from a FREE FUNCTION (make_tag). All
+    # owned locals must be reclaimed — factory results by the constructor rule,
+    # make_tag's result by interprocedural return-ownership inference.
+    mut p1 = Point.init(1, 2)
+    mut p2 = Point.init(4, 6)
+    mut dd = dist(p1, p2)          # p1/p2 borrowed, not consumed
+    mut tg = make_tag("id-", dd)   # free-function-returned owned Tag (str field)
+    mut tlen = tg.name.len()
+
+    # Nested owned class field: Holder.t owns a Tag (which owns a str). Holder's
+    # drop must recursively release Tag → str (recursive _trdrop_T).
+    mut t2 = make_tag("h-", dd)    # local owns the Tag
+    mut hd = Holder.init(t2)       # Holder co-owns it in field .t
+    mut hlen = hd.t.name.len()
+
+    # Inline owned rvalue as a call argument: the fresh Tag from make_tag is passed
+    # directly (no local bind) — gen_args must hoist+release the arg temp.
+    mut hd2 = Holder.init(make_tag("q-", dd))
+    mut h2len = hd2.t.name.len()
+
+    # List with heap-class elements: the list co-owns each; its drop releases them.
+    mut tl = Vec[Tag].init(4)
+    tl.append(make_tag("l-", dd))
+    tl.append(make_tag("m-", dd))
+    mut tllen = tl.len
+
+    # Dict with heap-class values: co-owns each value; drop releases them (Dict_free_objval).
+    mut dm: Dict[str, Tag] = {}
+    dm.insert("x", make_tag("dx-", dd))
+    dm.insert("y", make_tag("dy-", dd))
+    mut dmlen = dm.len()
+
+    # Class OWNING a collection field of heap-class elements: drop frees the field's
+    # Vec and releases each element (collection-field free + element release).
+    mut bin = Bin.init()
+    bin.put(make_tag("b1-", dd))
+    bin.put(make_tag("b2-", dd))
+    mut binlen = bin.items.len
+
+    # Set of heap-class elements (pointer-identity set): co-owns each; drop releases
+    # them (_tr_pset_free_obj).
+    mut ts = Set[Tag].init(8)
+    ts.add(make_tag("s1-", dd))
+    ts.add(make_tag("s2-", dd))
+    mut tslen = ts.len()
+
+    # Set literals: int-keyed and str-keyed. Locals must be freed on scope exit
+    # (the {..} literal allocates a _TrISet/_TrSet backing store).
+    mut iset = {1, 2, 3, 2, 1}
+    mut isetlen = iset.len
+    iset.add(4)
+    mut sset = {"p", "q", "p"}
+    mut ssetlen = sset.len
+
+def main():
+    workload()                                  # warm up (one-time allocations)
+    mut before = _tr_mem_live()
+    mut i = 0
+    while i < 5000:
+        workload()
+        i = i + 1
+    mut leaked = _tr_mem_live() - before
+    if leaked <= 0:
+        print("LEAK-GATE PASS (net " + leaked.to_str() + " over 5000 iters)")
+    else:
+        print("LEAK-GATE FAIL: " + leaked.to_str() + " net allocations leaked")

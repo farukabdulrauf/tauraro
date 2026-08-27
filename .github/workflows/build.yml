@@ -13,19 +13,15 @@ jobs:
           - os: ubuntu-latest
             platform: linux-x64
             ext: ""
-            seed_dir: tauraroc-Linux-X64
           - os: ubuntu-22.04-arm
             platform: linux-arm64
             ext: ""
-            seed_dir: tauraroc-Linux-ARM64
           - os: windows-latest
             platform: windows-x64
             ext: ".exe"
-            seed_dir: tauraroc-Windows-X64
           - os: macos-latest
             platform: macos-arm64
             ext: ""
-            seed_dir: tauraroc-macOS-ARM64
 
     runs-on: ${{ matrix.os }}
 
@@ -34,11 +30,12 @@ jobs:
         uses: actions/checkout@v4
 
       # -------------------------------------------------------
-      # Bootstrap: try latest GitHub Release zip first.
-      # If no release exists yet, fall back to the committed
-      # seed folder (tauraroc-<OS>-<ARCH>/tauraroc[.exe]).
-      # Once a real release is published the seed folders can
-      # be deleted from the repo — this fallback becomes a no-op.
+      # Bootstrap resolution:
+      #   1. Portable C seed  bootstrap/c/  -> compile to stage0   (primary)
+      #   2. Latest GitHub Release zip / binary                    (fallback)
+      # The portable C tree is platform-independent and committed, so it is
+      # the normal path and bootstraps every runner with no per-platform
+      # binaries. The release is only a safety net if bootstrap/c/ is absent.
       # -------------------------------------------------------
       - name: Prepare bootstrap binary
         shell: bash
@@ -47,30 +44,40 @@ jobs:
         run: |
           DEST="bootstrap/tauraroc-${{ matrix.platform }}"
           mkdir -p "$DEST"
-          DOWNLOADED=false
+          READY=false
 
-          # ── Try latest GitHub Release ────────────────────────────────
-          # List all assets so we can match regardless of how the release
-          # was created (automated zip, manual zip, or raw binary upload).
-          ASSET_LIST=$(gh release view \
-                         --repo "${{ github.repository }}" \
-                         --json assets \
-                         -q '.assets[].name' 2>/dev/null || true)
+          # ── 1. Portable C seed: compile bootstrap/c/ -> stage0 ───────
+          if [ -f "bootstrap/c/main.c" ]; then
+            echo "==> Building stage0 from portable C (bootstrap/c/)"
+            case "$RUNNER_OS" in
+              Windows) CC=gcc; LIBS="-lm -lws2_32"; CFLAGS="-D_GNU_SOURCE" ;;
+              macOS)   CC=cc;  LIBS="-lm"; CFLAGS="" ;;
+              *)       CC=gcc; LIBS="-lm -lpthread -lrt"; CFLAGS="-std=gnu11 -D_GNU_SOURCE -D_XOPEN_SOURCE=700" ;;
+            esac
+            "$CC" -O2 -w -Ibootstrap/c $CFLAGS \
+               bootstrap/c/main.c bootstrap/c/module_*.c bootstrap/c/include/core/*.c \
+               -o "$DEST/tauraroc${{ matrix.ext }}" $LIBS
+            echo "==> stage0 built: $DEST/tauraroc${{ matrix.ext }}"
+            READY=true
+          fi
 
-          if [ -n "$ASSET_LIST" ]; then
-            echo "==> Release assets found: $(echo "$ASSET_LIST" | tr '\n' ' ')"
+          # ── 2. Fallback: latest GitHub Release ───────────────────────
+          if [ "$READY" = "false" ]; then
+            echo "==> bootstrap/c/ absent; falling back to latest GitHub Release"
+            ASSET_LIST=$(gh release view \
+                           --repo "${{ github.repository }}" \
+                           --json assets \
+                           -q '.assets[].name' 2>/dev/null || true)
+            if [ -z "$ASSET_LIST" ]; then
+              echo "ERROR: no bootstrap/c/ seed and no published release to bootstrap from"
+              exit 1
+            fi
+            echo "==> Release assets: $(echo "$ASSET_LIST" | tr '\n' ' ')"
 
-            # Candidates tried in preference order:
-            #  1. our automated zip name  (tauraroc-linux-x64.zip)
-            #  2. legacy seed-dir zip     (tauraroc-Linux-X64.zip)
-            #  3. raw binary              (tauraroc / tauraroc.exe)
-            #  4. platform-named binary   (tauraroc-Linux-X64 / tauraroc-Windows-X64.exe)
+            # Try the automated zip first, then a raw binary asset.
             for CANDIDATE in \
                 "tauraroc-${{ matrix.platform }}.zip" \
-                "${{ matrix.seed_dir }}.zip" \
-                "tauraroc${{ matrix.ext }}" \
-                "${{ matrix.seed_dir }}${{ matrix.ext }}"; do
-
+                "tauraroc${{ matrix.ext }}"; do
               if echo "$ASSET_LIST" | grep -Fxq "$CANDIDATE"; then
                 echo "==> Downloading: $CANDIDATE"
                 gh release download \
@@ -78,49 +85,27 @@ jobs:
                   --pattern "$CANDIDATE" \
                   --dir bootstrap/ \
                   --clobber
-
                 if [[ "$CANDIDATE" == *.zip ]]; then
-                  # Unzip into a temp dir, then locate the binary inside
-                  # (handles both flat zip and nested folder zip)
                   rm -rf bootstrap/unzipped
                   unzip -o "bootstrap/$CANDIDATE" -d bootstrap/unzipped/
-                  BIN=$(find bootstrap/unzipped -name "tauraroc${{ matrix.ext }}" \
-                              ! -path "*/src/*" | head -1)
-                  [ -z "$BIN" ] && BIN=$(find bootstrap/unzipped \
-                              -name "tauraroc${{ matrix.ext }}" | head -1)
-                  if [ -z "$BIN" ]; then
-                    echo "ERROR: zip $CANDIDATE contained no tauraroc${{ matrix.ext }}"
-                    exit 1
-                  fi
+                  BIN=$(find bootstrap/unzipped -name "tauraroc${{ matrix.ext }}" ! -path "*/src/*" | head -1)
+                  [ -z "$BIN" ] && BIN=$(find bootstrap/unzipped -name "tauraroc${{ matrix.ext }}" | head -1)
+                  [ -z "$BIN" ] && { echo "ERROR: zip $CANDIDATE had no tauraroc${{ matrix.ext }}"; exit 1; }
                   cp "$BIN" "$DEST/tauraroc${{ matrix.ext }}"
                   rm -rf bootstrap/unzipped
                 else
-                  # Raw binary — rename to the canonical local name
                   mv "bootstrap/$CANDIDATE" "$DEST/tauraroc${{ matrix.ext }}"
                 fi
-
-                DOWNLOADED=true
+                READY=true
                 break
               fi
             done
 
-            if [ "$DOWNLOADED" = "false" ]; then
-              echo "==> No matching asset found in the release."
-              echo "    Available: $(echo "$ASSET_LIST" | tr '\n' ' ')"
-              echo "    Expected one of: tauraroc-${{ matrix.platform }}.zip | ${{ matrix.seed_dir }}.zip | tauraroc${{ matrix.ext }} | ${{ matrix.seed_dir }}${{ matrix.ext }}"
-            fi
-          else
-            echo "==> No published release found."
-          fi
-
-          # ── Fallback: committed seed binary ──────────────────────────
-          if [ "$DOWNLOADED" = "false" ]; then
-            echo "==> Falling back to committed seed binary in ${{ matrix.seed_dir }}/"
-            if [ ! -f "${{ matrix.seed_dir }}/tauraroc${{ matrix.ext }}" ]; then
-              echo "ERROR: no release asset matched AND no seed binary at ${{ matrix.seed_dir }}/tauraroc${{ matrix.ext }}"
+            if [ "$READY" = "false" ]; then
+              echo "ERROR: no matching release asset (wanted tauraroc-${{ matrix.platform }}.zip or tauraroc${{ matrix.ext }})"
+              echo "       Available: $(echo "$ASSET_LIST" | tr '\n' ' ')"
               exit 1
             fi
-            cp "${{ matrix.seed_dir }}/tauraroc${{ matrix.ext }}" "$DEST/"
           fi
 
           # ── Finalise BOOTSTRAP_BIN ────────────────────────────────────
@@ -133,11 +118,20 @@ jobs:
           echo "BOOTSTRAP_BIN=$BOOTSTRAP" >> "$GITHUB_ENV"
 
       # -------------------------------------------------------
-      # Single compilation pass — output lands in src/build/
+      # Single compilation pass.
+      # With the updated -o flag behaviour, a bare name like
+      #   tauraroc src/main.tr -o tauraroc
+      # places the binary in CWD (the repo root), not src/build/.
+      # The build scripts reflect this; no post-move step needed.
       # -------------------------------------------------------
       - name: Build (Linux / macOS)
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          # Override CC to use -std=gnu11 for ucontext functions on Linux
+          CC: "gcc"
+          CFLAGS: "-O2 -std=gnu11 -D_GNU_SOURCE -D_XOPEN_SOURCE=700"
+          LDFLAGS: "-lm -lpthread -lrt"
         run: bash scripts/build.sh
 
       - name: Build (Windows)
@@ -146,32 +140,521 @@ jobs:
         run: ./scripts/build.ps1
 
       # -------------------------------------------------------
-      # Move compiled binary to repo root, then wipe all
-      # temporary and seed directories before bundling so the
-      # artifact is clean: source + tauraroc[.exe] at root only.
+      # Verify the binary landed at the repo root, then wipe
+      # temporary directories before bundling the artifact.
       # -------------------------------------------------------
-      - name: Place binary at repo root
-        shell: bash
-        run: mv "src/build/tauraroc${{ matrix.ext }}" "./tauraroc${{ matrix.ext }}"
-
-      - name: Clean up temporary and seed directories
+      - name: Verify binary at repo root
         shell: bash
         run: |
-          rm -rf src/build
-          rm -rf bootstrap
-          rm -rf tauraroc-Linux-X64
-          rm -rf tauraroc-Linux-ARM64
-          rm -rf tauraroc-Windows-X64
-          rm -rf tauraroc-macOS-ARM64
+          if [ ! -f "tauraroc${{ matrix.ext }}" ]; then
+            echo "ERROR: tauraroc${{ matrix.ext }} not found at repo root"
+            ls -la
+            exit 1
+          fi
+          echo "==> Binary present: $(ls -lh tauraroc${{ matrix.ext }})"
 
       # -------------------------------------------------------
-      # Artifact = full source tree + tauraroc[.exe] at root.
+      # Bundle zig into the SDK, ONCE, early. `zig cc` = clang codegen + lld + a libc
+      # for EVERY target, so with zig beside the binary tauraroc needs NO system
+      # compiler and NO per-target sysroot — for `--backend llvm` AND `--target`
+      # cross. Placed here so every downstream step (the LLVM tests, the cross gate,
+      # and the uploaded artifact) is a complete, self-contained toolchain. The
+      # compiler auto-detects <exe_dir>/zig/ and prepends it to PATH (see
+      # activate_bundled_zig). Cached per (version, platform).
+      # -------------------------------------------------------
+      - name: Cache bundled zig
+        id: cache-zig
+        uses: actions/cache@v4
+        with:
+          path: zig
+          key: zig-0.16.0-${{ matrix.platform }}
+      - name: Bundle zig toolchain
+        if: steps.cache-zig.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          ZV=0.16.0
+          case "${{ matrix.platform }}" in
+            linux-x64)   ZA=x86_64-linux;   AEXT=tar.xz ;;
+            linux-arm64) ZA=aarch64-linux;  AEXT=tar.xz ;;
+            windows-x64) ZA=x86_64-windows; AEXT=zip ;;
+            macos-arm64) ZA=aarch64-macos;  AEXT=tar.xz ;;
+            *) echo "no zig mapping for ${{ matrix.platform }}"; exit 1 ;;
+          esac
+          curl -fsSL --retry 5 --retry-delay 3 "https://ziglang.org/download/$ZV/zig-$ZA-$ZV.$AEXT" -o "z.$AEXT"
+          mkdir -p zig
+          if [ "$AEXT" = "zip" ]; then
+            # Git Bash's `tar` is GNU tar (cannot extract .zip). Windows ships bsdtar
+            # (libarchive) at System32/tar.exe, which handles .zip AND --strip-components.
+            "/c/Windows/System32/tar.exe" -xf "z.$AEXT" --strip-components=1 -C zig
+          else
+            tar -xJf "z.$AEXT" --strip-components=1 -C zig
+          fi
+          rm -f "z.$AEXT"
+      - name: Verify bundled zig
+        shell: bash
+        run: |
+          "./zig/zig${{ matrix.ext }}" version
+          printf 'int main(void){return 0;}\n' > _z.c
+          "./zig/zig${{ matrix.ext }}" cc -target aarch64-linux-gnu -c _z.c -o _z.o && echo "zig cross-codegen OK"
+          rm -f _z.c _z.o
+
+      # -------------------------------------------------------
+      # Regression test suite: tests/lang/ and tests/regression/,
+      # run via `tauraroc --run` against the freshly-built binary
+      # on each platform. See scripts/run_tests.sh / run_tests.ps1.
+      # -------------------------------------------------------
+      - name: Run regression test suite (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          # Override CC to use -std=gnu11 for ucontext functions on Linux
+          CC: "gcc"
+          CFLAGS: "-O2 -std=gnu11 -D_GNU_SOURCE -D_XOPEN_SOURCE=700"
+          LDFLAGS: "-lm -lpthread -lrt"
+        run: bash scripts/run_tests.sh
+
+      - name: Run regression test suite (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/run_tests.ps1
+
+      # -------------------------------------------------------
+      # --no-heap bare-metal guarantee: the zero-heap firmware MUST compile (and run)
+      # while the heap-using counter-example MUST be rejected with [H-1]. Keeps the
+      # compile-time zero-heap wall + its examples honest. (Compile-time only; no cross
+      # toolchain, so it runs on every platform.)
+      # -------------------------------------------------------
+      - name: No-heap oracle (bare-metal zero-heap guarantee)
+        shell: bash
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/no_heap_check.sh
+
+      # -------------------------------------------------------
+      # Soundness corpus: programs that MUST be rejected under --strict (with the
+      # right diagnostic) + safe programs that MUST compile/run. Linux additionally
+      # builds the accept corpus with ASan/UBSan so latent UB in generated C is a
+      # hard failure. See scripts/run_soundness.sh / run_soundness.ps1.
+      # -------------------------------------------------------
+      - name: Soundness corpus (Linux, +ASan/UBSan)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CC: "gcc"
+          ASAN: "1"
+        run: bash scripts/run_soundness.sh
+
+      - name: Soundness corpus (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CC: "gcc"
+        run: bash scripts/run_soundness.sh
+
+      - name: Soundness corpus (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/run_soundness.ps1
+
+      # -------------------------------------------------------
+      # Leak gate + differential ARC-soundness oracle (Linux / macOS):
+      # runs the leak-prone workload under -DTAURARO_MEMCOUNT with borrow
+      # elision ON and OFF (--no-elide = pure-ARC ground truth). BOTH must be
+      # leak-free AND produce byte-identical net counts — an unsound elision
+      # (a dropped/duplicated retain/release) diverges here and fails the gate.
+      # -------------------------------------------------------
+      - name: Leak gate + elision oracle (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CC: "gcc"
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/leak_check.sh
+
+      # -------------------------------------------------------
+      # Concurrency corpus under sanitizers (Linux): each tests/concurrency/*.tr
+      # runs under ThreadSanitizer (data races — a lost Mutex update, or a
+      # non-atomic refcount touched by two threads) AND AddressSanitizer (UAF /
+      # double-free of state crossing the spawn/Mutex/Shared boundary). This is
+      # the oracle that a program compiling under --strict is actually thread-safe
+      # at runtime — not just "didn't crash in a few runs".
+      # -------------------------------------------------------
+      - name: Concurrency corpus — ThreadSanitizer (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CC: "gcc"
+          TSAN: "1"
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/run_concurrency.sh
+
+      - name: Concurrency corpus — AddressSanitizer (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CC: "gcc"
+          ASAN: "1"
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/run_concurrency.sh
+
+      # -------------------------------------------------------
+      # Ownership fuzz oracle: generate random ownership-stressing programs and
+      # subject each to (1) differential elision (elided == pure-ARC output),
+      # (2) net-leak accounting, and (3) AddressSanitizer (double-free / UAF) on
+      # Linux. Turns "found by accident" into "found by CI" for the drop/escape
+      # analysis. tests/fuzz/FINDINGS.md tracks known-open patterns (HARD tier);
+      # the CORE tier here must stay green. See scripts/fuzz_check.sh.
+      # -------------------------------------------------------
+      - name: Ownership fuzz oracle (Linux, +ASan)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CC: "gcc"
+          ASAN: "1"
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/fuzz_check.sh 120
+
+      - name: Ownership fuzz oracle (macOS / Windows, differential + leak)
+        if: runner.os != 'Linux'
+        shell: bash
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/fuzz_check.sh 60
+
+      # -------------------------------------------------------
+      # Reactor stress gate: a green-thread echo server hammered by concurrent
+      # keep-alive clients, exercising the REAL readiness reactor (epoll on
+      # Linux, kqueue on macOS) and its per-request re-arm path. Guards reactor
+      # changes — notably the persistent-epoll-registration optimization — from
+      # dropping events / mis-tracking fds. Linux/macOS only (Windows uses
+      # WSAPoll and is covered locally); timeout-bounded so a hang fails fast.
+      # -------------------------------------------------------
+      - name: Reactor stress test (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CC: "gcc"
+          CFLAGS: "-O2 -std=gnu11 -D_GNU_SOURCE -D_XOPEN_SOURCE=700"
+          LDFLAGS: "-lm -lpthread -lrt"
+        run: bash scripts/reactor_stress.sh
+
+      # -------------------------------------------------------
+      # Cross-compilation gate (Linux). (A) edge/gateway: cross-compile a real
+      # heap program to aarch64 Linux and RUN it under qemu — proves the std
+      # runtime + ARC cross-compile and execute on ARM. (B) bare-metal: compile a
+      # no-OS program freestanding for arm-none-eabi with a custom bump allocator
+      # and NO libc, reporting the remaining seams. See docs/dev/08. This is the
+      # faithful validator (MinGW can't do freestanding — its stdatomic pulls x86
+      # intrinsics). Uses a real cross-toolchain instead.
+      # -------------------------------------------------------
+      - name: Install cross toolchains (aarch64 + arm-none-eabi + riscv64 + qemu)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static gcc-arm-none-eabi qemu-system-arm gcc-riscv64-unknown-elf qemu-system-misc
+
+      - name: Cross-compile gate (edge aarch64 run + bare-metal boundary)
+        if: runner.os == 'Linux'
+        # Blocking: part A (edge aarch64 build + qemu run) is PROVEN green and now
+        # guards the std runtime's ARM cross-compilability. Part B (bare-metal
+        # boundary) stays informational *within* the script (non-fatal) — it reports
+        # the remaining seams to gate; see docs/dev/08.
+        shell: bash
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/cross_check.sh
+
+      # -------------------------------------------------------
+      # Phase 2 guard: auto-detected `zig cc` cross-compilation. zig bundles the
+      # target libc, so `--target linux-arm64` needs NO sysroot. Cross-compile a
+      # program with BOTH backends and RUN each under qemu-aarch64 (installed
+      # above), proving the zig-driven cross path builds *and executes*. zig is
+      # scoped to THIS step only (prepended to PATH) so it doesn't change the
+      # gcc-based cross_check gate above.
+      # -------------------------------------------------------
+      - name: Cross-compile via bundled zig (linux-arm64, both backends) + qemu run
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -e
+          # tauraroc auto-activates the bundled zig from the early step (<exe_dir>/zig/).
+          printf 'def main() -> int:\n    print("cross zig ok")\n    return 0\n' > zx.tr
+          # C backend, STATIC musl so it runs under qemu-user with no aarch64 ld.so on
+          # the x86 runner (a dynamic aarch64 binary needs /lib/ld-linux-aarch64.so.1;
+          # and zig refuses to static-link glibc — musl static-links cleanly).
+          ./tauraroc${{ matrix.ext }} zx.tr --target aarch64-linux-musl --static -o zx_c
+          file zx_c | grep -qi aarch64 || { echo "FAIL: zx_c not aarch64"; exit 1; }
+          out="$(qemu-aarch64-static zx_c)"
+          echo "  [c] qemu run: $out"
+          [ "$out" = "cross zig ok" ] || { echo "FAIL: unexpected C cross output ('$out')"; exit 1; }
+          # LLVM backend: verify it cross-codegens a real aarch64 binary (arch check).
+          ./tauraroc${{ matrix.ext }} zx.tr --backend llvm --target linux-arm64 -o zx_llvm
+          file zx_llvm | grep -qi aarch64 || { echo "FAIL: zx_llvm not aarch64"; exit 1; }
+          echo "zig cross gate: C ran under qemu + LLVM built a real aarch64 binary ✅"
+
+      # -------------------------------------------------------
+      # Bare-metal LINK + RUN: build examples/freestanding/mcu_app/ — a COMPREHENSIVE
+      # multi-module Cortex-M3 firmware written 100% in Tauraro (a main module with
+      # @allocator/@output/@entry that imports console/mathx/sysinfo sub-modules) —
+      # with --freestanding + --emit-ld, then RUN it under qemu-system-arm. Proves a
+      # multi-module Tauraro binary executes on bare metal with NO C/.h/.ld shims.
+      # -------------------------------------------------------
+      - name: Bare-metal run (Cortex-M3 under qemu-system-arm)
+        if: runner.os == 'Linux'
+        # Blocking: PROVEN green — a Tauraro binary links freestanding and executes
+        # on bare metal under qemu (UART prints "hello from bare metal" + a real
+        # computed sum). Guards that the freestanding runtime + --freestanding stay
+        # link-and-run correct on a real MCU target.
+        shell: bash
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/bare_run.sh
+
+      # Second bare-metal architecture: the SAME --freestanding path targeting RISC-V
+      # (qemu 'virt', rv64). The compiler emits the RISC-V _start boot code + linker
+      # script; proves the bare-metal support is arch-portable, not Cortex-M-specific.
+      - name: Bare-metal run (RISC-V rv64 under qemu-system-riscv64)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/bare_run_riscv.sh
+
+      # Native backend (Path B): compile a Tauraro program STRAIGHT to an x86-64 ELF
+      # object (no C source, no gcc for the user code), link it with runtime.o + libc,
+      # and run it. Proves the taumir(LIR) -> x86-64 -> ELF -> link pipeline.
+      - name: Native backend run (x86-64/ELF, no C)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/native_run.sh
+
+      # Differential oracle: every tests/native/*.tr compiled by BOTH the C backend and the
+      # native x86-64/ELF backend must produce byte-identical output — proves the
+      # from-scratch machine-code backend matches the reference on all covered features.
+      - name: Native ≡ C differential oracle
+        if: runner.os == 'Linux'
+        shell: bash
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/native_diff.sh
+
+      # Native ARC: the generated retain/release calls must balance — a locals-only string
+      # program must leave 0 refcounted strings live at exit (also catches double-free/UAF).
+      - name: Native ARC leak check
+        if: runner.os == 'Linux'
+        shell: bash
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/native_leak_check.sh
+
+      # LLVM backend (Path A): compile a Tauraro program to textual LLVM IR (no C source
+      # for the user code), lower it with clang/llc, link with runtime.o, and run it.
+      # Proves the taumir(LIR) -> LLVM IR -> native pipeline end to end.
+      - name: LLVM backend run (LLVM IR, no C)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Opaque pointers need LLVM >= 15 (ubuntu-22.04-arm's default clang is 14):
+          # install clang-15 as a fallback so ARM64 gets real LLVM coverage too.
+          V="$(clang --version 2>/dev/null | grep -oE 'clang version [0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
+          if [ -z "$V" ] || [ "$V" -lt 15 ]; then
+            sudo apt-get install -y --no-install-recommends clang-15 || sudo apt-get install -y --no-install-recommends clang || true
+          fi
+          TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/llvm_run.sh
+
+      # Differential oracle: every tests/native/*.tr compiled by BOTH the C backend and the
+      # LLVM backend must produce byte-identical output. The LLVM backend consumes the same
+      # LIR as native, so this covers its whole feature surface.
+      - name: LLVM ≡ C differential oracle
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 20   # the script self-bounds each test; this caps the whole step so a
+                              # pathological hang fails fast instead of stalling the runner.
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/llvm_diff.sh
+
+      # FFI proof: extern "C" calls into a custom C object + `export def` producing a
+      # C-ABI symbol. External linkage can't be tested via the C≡LLVM differential.
+      - name: LLVM FFI (extern C + export)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/llvm_ffi.sh
+
+      # Object-ARC leak oracle: the C≡LLVM output differential is blind to leaks/UAF, so
+      # object refcounting has its own memory oracle (live-object count == 0 at exit).
+      - name: LLVM object-leak oracle (object ARC)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/obj_leak.sh
+
+      # ARC hardening: AddressSanitizer over the LLVM backend catches a use-after-free /
+      # double-free from object refcounting (a UAF can print the right value, so neither the
+      # output differential nor the leak oracle would see it). LeakSanitizer is left off.
+      - name: LLVM ARC ASan hardening
+        if: runner.os == 'Linux'
+        shell: bash
+        run: TAURAROC=./tauraroc${{ matrix.ext }} bash scripts/obj_asan.sh
+
+      # Runtime security regressions (V-001 float-format overflow, etc.) under ASan+UBSan.
+      - name: Runtime security tests (ASan/UBSan)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/security_test.sh
+
+      - name: Clean up generated build output
+        shell: bash
+        run: |
+          # src/ is shipped in the artifact, so drop the generated C tree.
+          rm -rf src/build
+
+      # -------------------------------------------------------
+      # SHA256 checksum of the compiler binary for this platform.
+      # The .sha256 file is bundled inside the main artifact (next to
+      # the binary and source trees) AND uploaded separately so it can
+      # be downloaded standalone and pasted into the release notes.
+      # -------------------------------------------------------
+      - name: Generate SHA256 checksum
+        shell: bash
+        run: |
+          sha256sum "tauraroc${{ matrix.ext }}" > "tauraroc-${{ matrix.platform }}.sha256"
+          cat "tauraroc-${{ matrix.platform }}.sha256"
+
+      # NOTE: the old from-source minimal-LLVM build (llc + lld, ~30-60 min uncached)
+      # is GONE. The SDK bundles ZIG instead (see the early "Bundle zig toolchain"
+      # step), and `zig cc` IS clang (compiles the .ll directly) + lld + a libc for
+      # every target — so it supersedes a separate llc/lld bundle for host and cross.
+      # The step below runs on ALL platforms and relies on the bundled zig (auto-
+      # detected at <exe_dir>/zig/), so --backend llvm works even where no system
+      # clang/llc exists (e.g. Windows).
+      - name: Verify --backend llvm builds and runs
+        shell: bash
+        env:
+          TAURARO_PATH: ${{ github.workspace }}
+        run: |
+          set -e
+          printf 'def main():\n    mut xs = [10, 20, 30]\n    mut s = 0\n    mut i = 0\n    while i < xs.len:\n        s = s + xs.get(i)\n        i = i + 1\n    print(s)\n' > llc_probe.tr
+          rm -rf build
+          # LLVM backend lowers .ll and compiles it via the host toolchain cascade
+          # (system clang/llc if present, else bundled zig cc). Just assert it runs.
+          "./tauraroc${{ matrix.ext }}" llc_probe.tr --backend llvm -o "llc_probe${{ matrix.ext }}"
+          OUT=$("./llc_probe${{ matrix.ext }}")
+          echo "llvm-backend output: $OUT"
+          test "$OUT" = "60"
+          rm -f llc_probe.tr "llc_probe${{ matrix.ext }}"
+
+      # -------------------------------------------------------
+      # Artifact = the compiler binary + the BUNDLED ZIG TOOLCHAIN + the source/
+      # library/sample trees — a COMPLETE, self-contained SDK. `zig/` (~200 MB) is
+      # `zig cc` = clang + lld + a libc for every target, so one download gives the
+      # full toolchain: --backend llvm and --target cross work with nothing else
+      # installed. (Not the whole workspace: no .git, docs, bootstrap scratch, build.)
       # -------------------------------------------------------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: tauraroc-${{ matrix.platform }}
-          path: .
+          if-no-files-found: error
+          path: |
+            tauraroc${{ matrix.ext }}
+            tauraroc-${{ matrix.platform }}.sha256
+            zig/
+            src/
+            std/
+            runtime/
+            examples/
+            benchmarks/
+
+      # -------------------------------------------------------
+      # Standalone checksum artifact, one per OS target, so it can be
+      # downloaded and pasted into the GitHub release notes manually.
+      # -------------------------------------------------------
+      - name: Upload SHA256 checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauraroc-${{ matrix.platform }}-sha256
+          if-no-files-found: error
+          path: tauraroc-${{ matrix.platform }}.sha256
+
+  # -----------------------------------------------------------------
+  # Benchmarks: run the C vs Rust vs Tauraro suite (time + peak memory)
+  # on Linux after the build, then commit the Markdown report to
+  # benchmarks/results.md. Per request: results are NOT uploaded as an
+  # artifact -- they live in the repo as a tracked .md file.
+  # Only runs on pushes to the default branch (master); skipped on PRs
+  # and forks. The commit message carries [skip ci] to avoid re-triggering.
+  #
+  # IMPORTANT: gated to the canonical org repo (tauraro/tauraro) only, which owns
+  # the official benchmark numbers. results.md is auto-generated, so if BOTH the
+  # org repo and the dev fork (Yusee-Programmer/tauraro) ran this job they would
+  # commit divergent results.md files, and every cross-repo PR (fork -> org) would
+  # conflict on it (GitHub's web merge ignores the .gitattributes merge=ours
+  # driver). Letting only the org repo touch results.md means the fork never
+  # modifies it, so those PRs stay conflict-free everywhere.
+  # -----------------------------------------------------------------
+  benchmark:
+    needs: build
+    if: >-
+      github.event_name == 'push'
+      && github.ref == 'refs/heads/master'
+      && github.repository == 'tauraro/tauraro'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Token + full ref so we can commit results.md back to the branch.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install toolchains (gcc, rustc, GNU time)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y time
+          if ! command -v rustc >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Download tauraroc (linux-x64 build artifact)
+        uses: actions/download-artifact@v4
+        with:
+          name: tauraroc-linux-x64
+          path: artifact/
+
+      - name: Stage compiler at repo root
+        run: |
+          cp artifact/tauraroc ./tauraroc
+          chmod +x ./tauraroc
+          ./tauraroc --version || true
+
+      - name: Run benchmark suite (time + peak memory)
+        run: |
+          bash benchmarks/run_all.sh || true
+          echo "===== benchmarks/results.md ====="
+          cat benchmarks/results.md || echo "no results.md produced"
+
+      - name: Commit results.md (auto-resolving conflicts)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Register the 'ours' merge driver that .gitattributes maps
+          # benchmarks/results.md to, so if master advances while this job runs,
+          # results.md auto-resolves to THIS run's freshly-generated file instead
+          # of stopping on a conflict. This is the same resolution
+          # scripts/resolve-benchmark-conflicts.ps1 sets up locally — running
+          # automatically here so it never has to be done by hand.
+          git config merge.ours.driver true
+          git add benchmarks/results.md
+          if git diff --cached --quiet; then
+            echo "No benchmark changes to commit."
+            exit 0
+          fi
+          git commit -m "ci: update benchmark results [skip ci]"
+          # Push robustly: if origin/master moved since checkout, merge it in
+          # (results.md auto-resolves to ours via the driver) and retry. Avoids
+          # a failed job — and a conflict the maintainer would resolve by hand —
+          # when another push lands during the benchmark run.
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD:master; then
+              echo "Pushed benchmark results."
+              exit 0
+            fi
+            echo "Push rejected (master moved); integrating latest and retrying ($attempt/5)..."
+            git fetch origin master
+            git merge --no-edit origin/master || {
+              echo "Unexpected non-results.md conflict; aborting merge."
+              git merge --abort || true
+              exit 1
+            }
+            sleep 3
+          done
+          echo "Could not push benchmark results after 5 attempts."
+          exit 1
 
   # -----------------------------------------------------------------
   # Release: runs only on v* tag pushes after all builds pass.
@@ -212,16 +695,94 @@ jobs:
           name: tauraroc-macos-arm64
           path: release/macos-arm64/
 
-      # zip -j strips the path so the binary sits at the zip root:
-      # unzip tauraroc-linux-x64.zip -d bootstrap/tauraroc-linux-x64/
-      # → bootstrap/tauraroc-linux-x64/tauraroc
-      - name: Zip per-platform binaries
+      # Per-platform binary checksums (generated during the build job),
+      # downloaded here so they can be folded into the combined
+      # SHA256SUMS.txt and also published as individual release assets.
+      - name: Download linux-x64 checksum
+        uses: actions/download-artifact@v4
+        with:
+          name: tauraroc-linux-x64-sha256
+          path: release/checksums/
+
+      - name: Download linux-arm64 checksum
+        uses: actions/download-artifact@v4
+        with:
+          name: tauraroc-linux-arm64-sha256
+          path: release/checksums/
+
+      - name: Download windows-x64 checksum
+        uses: actions/download-artifact@v4
+        with:
+          name: tauraroc-windows-x64-sha256
+          path: release/checksums/
+
+      - name: Download macos-arm64 checksum
+        uses: actions/download-artifact@v4
+        with:
+          name: tauraroc-macos-arm64-sha256
+          path: release/checksums/
+
+      # `tauraroc` sits at the zip root, with `zig/` alongside it, so `--backend llvm`
+      # AND `--target <t>` are self-contained from the download AND the bootstrap seed
+      # still resolves the binary (build job: `find -name tauraroc`, which ignores the
+      # sibling zig/ dir and copies only the binary):
+      #   unzip tauraroc-linux-x64.zip -d bootstrap/tauraroc-linux-x64/
+      #   → bootstrap/tauraroc-linux-x64/{tauraroc, zig/, runtime/, std/}
+      # Fetch each platform's zig and drop it into that platform's SDK tree so the
+      # zip below is a batteries-included toolchain. Extracted fresh here (not via
+      # the build artifacts) so ~200 MB of zig + its internal symlinks never round-
+      # trips through artifact upload/download. bsdtar extracts .tar.xz and .zip.
+      - name: Fetch zig for each platform SDK
+        run: |
+          set -e
+          ZV=0.16.0
+          fetch() { # <platform-dir> <zig-arch-os> <ext>
+            local d="release/$1" za="$2" ax="$3"
+            curl -fsSL --retry 5 --retry-delay 3 "https://ziglang.org/download/$ZV/zig-$za-$ZV.$ax" -o "z.$ax"
+            mkdir -p "$d/zig" && tar -xf "z.$ax" --strip-components=1 -C "$d/zig" && rm -f "z.$ax"
+            test -e "$d/zig/zig" -o -e "$d/zig/zig.exe"
+          }
+          fetch linux-x64   x86_64-linux   tar.xz
+          fetch linux-arm64 aarch64-linux  tar.xz
+          fetch windows-x64 x86_64-windows zip
+          fetch macos-arm64 aarch64-macos  tar.xz
+
+      - name: Zip per-platform SDK bundles
+        # A COMPLETE, self-contained SDK sits at the zip root:
+        #   tauraroc          the compiler
+        #   zig/              bundled zig — `zig cc` = clang (compiles the LLVM .ll) + lld
+        #                     + a libc for EVERY target. Powers --backend llvm AND cross
+        #                     (--target) with NO system compiler or per-target sysroot.
+        #   runtime/          native_abi.c + headers, auto-found + compiled by the backends
+        #   std/              the standard library (for `import`)
+        # So `tauraroc prog.tr --backend llvm -o prog` AND `tauraroc prog.tr --target linux-arm64`
+        # both work straight out of the unzip. The bootstrap seed still
+        # resolves the binary via `find -name tauraroc` (runtime/ and std/ contain no such
+        # file), so this zip doubles as the seed unchanged.
         run: |
           mkdir -p release/assets
-          zip -j release/assets/tauraroc-linux-x64.zip   release/linux-x64/tauraroc
-          zip -j release/assets/tauraroc-linux-arm64.zip release/linux-arm64/tauraroc
-          zip -j release/assets/tauraroc-windows-x64.zip release/windows-x64/tauraroc.exe
-          zip -j release/assets/tauraroc-macos-arm64.zip release/macos-arm64/tauraroc
+          A="$GITHUB_WORKSPACE/release/assets"
+          # `zig/` rides along so cross-compilation to any target is self-contained
+          # (zig cc = clang + lld + libc for every target; no system compiler/sysroot).
+          ( cd release/linux-x64   && zip -qr "$A/tauraroc-linux-x64.zip"   tauraroc     zig runtime std )
+          ( cd release/linux-arm64 && zip -qr "$A/tauraroc-linux-arm64.zip" tauraroc     zig runtime std )
+          ( cd release/windows-x64 && zip -qr "$A/tauraroc-windows-x64.zip" tauraroc.exe zig runtime std )
+          ( cd release/macos-arm64 && zip -qr "$A/tauraroc-macos-arm64.zip" tauraroc     zig runtime std )
+
+      # -------------------------------------------------------
+      # Combined SHA256SUMS.txt: checksums of the release zips
+      # (what users actually download) plus the raw per-platform
+      # binary checksums from the build job, for reference.
+      # -------------------------------------------------------
+      - name: Generate combined SHA256SUMS.txt
+        run: |
+          cd release/assets
+          sha256sum *.zip > SHA256SUMS.txt
+          cd -
+          echo "" >> release/assets/SHA256SUMS.txt
+          echo "# Per-platform binary checksums (uncompressed):" >> release/assets/SHA256SUMS.txt
+          cat release/checksums/*.sha256 >> release/assets/SHA256SUMS.txt
+          cat release/assets/SHA256SUMS.txt
 
       - name: Create GitHub Release
         env:
@@ -233,4 +794,5 @@ jobs:
             release/assets/tauraroc-linux-x64.zip \
             release/assets/tauraroc-linux-arm64.zip \
             release/assets/tauraroc-windows-x64.zip \
-            release/assets/tauraroc-macos-arm64.zip
+            release/assets/tauraroc-macos-arm64.zip \
+            release/assets/SHA256SUMS.txt
